@@ -57,4 +57,4 @@ python agent-passports/passport.py validate               # rules check (exit 1 
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).
