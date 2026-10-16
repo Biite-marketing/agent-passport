@@ -70,11 +70,12 @@ It adds one command, `passport.py hook`, to five events (re-running it updates o
 | `PreToolUse` (Agent/Task) | new passport: task (from `description`), prompt excerpt, agent type, tools and model from `.claude/agents/<type>.md` or the passport it is an instance of, reports to the chief, owner = chief's owner |
 | `SubagentStart` | the subagent's runtime id |
 | `PostToolUse` (Agent/Task) | the model actually used (`resolvedModel`), tokens, duration, result; ends the run unless it runs in the background |
-| `PostToolUse` (Write/Edit/MultiEdit/NotebookEdit, Bash/PowerShell, `mcp__*`) | audit trail: every file change with the file's SHA-256, every command and every external MCP action, tied to the agent that did it (secrets redacted) |
+| `PreToolUse` (Write/Edit/..., Bash/PowerShell) | refuses direct edits to `activity.jsonl` / `anchors.jsonl` |
+| `PostToolUse` (Write/Edit/MultiEdit/NotebookEdit, Bash/PowerShell, `mcp__*`) | audit trail: file changes made with the edit tools (with the file's SHA-256), commands and external MCP actions, tied to the agent that did them (known secret patterns redacted) |
 | `SubagentStop` | ends background runs with their final message and transcript path |
-| `SessionEnd` | closes anything still open in that session and marks its subagents non-invocable |
+| `SessionEnd` | closes anything still open in that session, marks its subagents non-invocable, and writes an anchor (sent out of reach if `PASSPORT_ANCHOR_FILE` / `PASSPORT_ANCHOR_URL` is set) |
 
-The hook never blocks or slows the agent down. Errors go to `agent-passports/hook-errors.log` and the hook exits 0, and it rebuilds the organogram after each finished run. Hooks are read when a session starts, so they apply from the next session. Set `PASSPORT_OWNER="Name"` in the environment, or make sure `git config user.name` is set, so the chief gets the right accountable human. Otherwise it says "unknown" until someone fills it in.
+The hook only ever blocks one thing: direct edits to the audit log and anchors. Registry errors never stop the agent. They go to `agent-passports/hook-errors.log`, are recorded in the trail as a gap, and the hook exits 0. It rebuilds the organogram after each finished run and writes an anchor at session end. Hooks are read when a session starts, so they apply from the next session. Set `PASSPORT_OWNER="Name"` in the environment, or make sure `git config user.name` is set, so the chief gets the right accountable human. Otherwise it says "unknown" until someone fills it in.
 
 **Other frameworks.** LangGraph, CrewAI, OpenAI Agents SDK, AutoGen, n8n and similar tools can do the same in code. At the point where an agent is created or called, run:
 ```sh

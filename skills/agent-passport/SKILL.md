@@ -1,6 +1,6 @@
 ---
 name: agent-passport
-description: "Give every AI agent and subagent a passport before it goes live, register subagents automatically, and keep a tamper-evident audit trail and organogram: who exists, what each agent does, on which model, with which data and permissions, who it reports to, whether it can still be invoked, and which agent changed which file, ran which command or touched which external system (linked read-only to graphify when present). Use whenever an agent, subagent, bot, orchestrator or AI workflow is created, spawned, deployed, changed (model, tools, data, permissions), killed or reviewed; when someone asks which agents exist, for an agent organogram, who to hand work to, who did what, which agent changed a file or caused an incident; for audit evidence (ISO 42001, ISO 27001, NEN 7510, EU AI Act); or when agent-passports/ exists. Works with any LLM."
+description: "Give every AI agent and subagent a passport before it goes live, register subagents automatically, and keep a hash-chained audit trail and organogram: who exists, what each agent does, on which model, with which data and permissions, who it reports to, whether it can still be invoked, and which agent changed which file, ran which command or touched which external system (linked read-only to graphify when present). Use whenever an agent, subagent, bot, orchestrator or AI workflow is created, spawned, deployed, changed (model, tools, data, permissions), killed or reviewed; when someone asks which agents exist, for an agent organogram, who to hand work to, who did what, which agent changed a file or caused an incident; for audit evidence (ISO 42001, ISO 27001, NEN 7510, EU AI Act); or when agent-passports/ exists. Works with any LLM."
 ---
 
 # Agent Passport
@@ -24,8 +24,9 @@ Everything is written to one folder in the project root, which humans and agents
 ```
 agent-passports/
 ├── passports/AGT-0001.json   one passport per agent or subagent run (source of truth, never deleted)
-├── activity.jsonl            hash-chained audit log: spawns, endings, status changes, every file change
-│                             (with file hash), command and external MCP action, each tied to an agent
+├── activity.jsonl            hash-chained audit log: spawns, endings, status changes, seals, reviews, file changes
+│                             (with file hash), commands and external MCP actions, each tied to an agent
+├── anchors.jsonl             checkpoints of the log's head (count + hash), written at every session end
 ├── registry.html             the organogram: click an agent for its passport and a ready-to-paste message
 ├── REGISTRY.md               the same in text: findings, directory, who did what, every passport
 ├── registry.json             machine-readable directory for agents: who exists, who may call whom
@@ -36,7 +37,7 @@ agent-passports/
 ## Roles in the organogram
 
 - **Humans** are at the top. Every agent has an accountable human `owner`.
-- **The chief** is the main session that talks to the user and spawns subagents. It gets one persistent passport per project (`role: chief`), which is created automatically on the first spawn if it doesn't exist yet.
+- **The chief** is the main session that talks to the user and spawns subagents. It gets one persistent passport per project (`role: chief`), which is created automatically by the first hook event if it doesn't exist yet.
 - **Persistent agents** are defined once (for example in `.claude/agents/x.md`) and have a full, human-reviewed passport.
 - **Subagent runs** are temporary (`kind: ephemeral`). Each spawn gets its own passport that reports to the chief. When the run is a custom agent with a persistent passport, it is linked through `instance_of` and inherits that passport's model, data and permissions.
 
@@ -57,12 +58,13 @@ Before `init`, call `<skill-dir>/scripts/passport.py`. After `init`, use `agent-
 | `review ID --by NAME [--notes]` | record the quarterly review |
 | `report [--since today\|YYYY-MM-DD] [--session ID]` | **who did what**: every subagent run with task, model, tools, time, tokens and result |
 | `trace <file\|folder\|graphify cluster>` | **audit**: who changed it, when, with which tool, file hash after the change, related files in the graphify graph, and the passports of the agents involved |
-| `verify` | prove the audit log was not edited, removed or reordered (hash chain) |
+| `verify [--head COUNT:HASH] [--anchors FILE]` | check the hash chain and compare it with every anchor: detects edits, and with an external anchor also a rewritten, truncated or deleted log |
+| `anchor [--reason]` | record the log's current head now (also sent to `PASSPORT_ANCHOR_FILE` / `PASSPORT_ANCHOR_URL` if set) |
 | `directory` | which agents can be invoked now, and how |
 | `validate [--strict]` | check all rules; exit 1 on errors |
 | `build` | regenerate registry.html, REGISTRY.md, registry.json |
 
-The script calculates a fingerprint over `model`, `task`, `data_dependencies`, `permissions`, `access` and `reports_to`. If those fields change without `seal`, validation fails. That enforces rule 2 without relying on anyone's memory.
+The script calculates a fingerprint over `model`, `task`, `data_dependencies`, `permissions`, `access`, `reports_to`, `owner`, `kind`, `role` and `auto_registered`. If those fields change without `seal`, validation fails, and every seal and review is also written to the hash-chained log with the real time. This catches forgotten updates. It is not a security boundary, because anyone who can edit the files can also run `seal`.
 
 ## Workflows
 
@@ -100,13 +102,18 @@ When the user asks what agents did, which subagent touched what, or for a status
 
 ### Audits and incidents: "what went wrong, where, and which agent did it?"
 
-With hooks installed, every file change (with the file's SHA-256 after the change), every shell command and every external action through an MCP server (CRM, mail, databases) is written to `activity.jsonl` and tied to the passport of the agent that did it. Changes made by the chief carry the chief's ID; changes made inside a subagent carry that subagent's ID. Secrets in commands are redacted before they are written.
+With hooks installed, file changes made with the edit tools (with the file's SHA-256 after the change), shell commands and external actions through MCP servers (CRM, mail, databases) are written to `activity.jsonl` and tied to the passport of the agent that did them. Changes made by the chief carry the chief's ID. Changes made inside a subagent carry that subagent's runtime ID, which is linked to its passport by the spawn's `tool_use_id`, so parallel subagents of the same type are told apart correctly. Known secret patterns in commands and MCP inputs are redacted before anything is written. This is best effort, so keep secrets out of commands anyway.
+
+Know the limits before you rely on it:
+- **Reads are not logged.**
+- **Indirect changes are not attributed per file.** A file changed by a shell command (`sed -i`, a script, `git checkout`) only shows up as the command.
+- **Errors leave gaps, not blocks.** A hook error never stops the agent. It is recorded as a gap in the trail, and validation flags it.
 
 To investigate:
 1. `trace <file, folder or graphify cluster name>`: who touched it, when, with which tool, and in which session.
 2. Open the passports of the agents involved: model, permissions, data, who they reported to, and their result (`runtime.result_summary`, plus the transcript path).
 3. `report --session <id>` for the full context of that session.
-4. `verify` to show the trail is intact. Each entry carries the hash of the previous one, so editing, deleting or reordering any line breaks the chain.
+4. `verify` to check the trail. Each entry carries the hash of the previous one, so editing, deleting or reordering a line breaks the chain. Someone with write access could still rewrite the whole chain, unless an anchor stored outside the project exists. For audit use, set `PASSPORT_ANCHOR_FILE` (a share or synced folder the agent can't write to) or `PASSPORT_ANCHOR_URL` (a webhook or log collector). Then every session end sends the log's head out of reach. Direct edits to the log through the agent's tools are blocked by a hook.
 
 Treat `activity.jsonl` and `passports/` as evidence: never edit or delete them, and commit them to version control so history is preserved off-machine. `references/audit.md` has an incident playbook and how the trail maps to ISO/IEC 42001, ISO/IEC 27001, NEN 7510 and the EU AI Act.
 
@@ -114,7 +121,7 @@ Treat `activity.jsonl` and `passports/` as evidence: never edit or delete them, 
 
 If the project has `graphify-out/graph.json`, the registry links to it: every changed file shows its graphify cluster ("community"), the graph nodes in that file, and the files connected to it in the graph. This shows the blast radius of a change, for example: "AGT-0007 changed `src/auth.py` in cluster *Session handling*; connected files are `api.py` and `middleware.py`."
 
-This link is strictly read-only. The skill opens `graph.json` for reading and never writes, moves, rebuilds or updates anything in `graphify-out/`, and you shouldn't either as part of this skill. If the graph looks out of date (files marked "not in graph"), tell the user they can rebuild it with graphify themselves.
+This link is read-only. The skill opens `graph.json` for reading and never writes, moves, rebuilds or updates anything in `graphify-out/`, and you shouldn't either as part of this skill. If the graph looks out of date (files marked "not in graph"), tell the user they can rebuild it with graphify themselves.
 
 ### Changing an agent
 

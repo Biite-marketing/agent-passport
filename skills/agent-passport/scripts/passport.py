@@ -47,10 +47,43 @@ SPAWN_TOOLS = {"Agent", "Task"}
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 COMMAND_TOOLS = {"Bash", "PowerShell"}
 TRACKED_TOOLS = SPAWN_TOOLS | FILE_TOOLS | COMMAND_TOOLS
-SECRET_RE = re.compile(r"(?i)(bearer\s+\S+|(?:api[_-]?key|token|secret|password|passwd|pwd)\s*[=:]\s*\S+|sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,})")
+PROTECTED_FILES = {"activity.jsonl", "anchors.jsonl"}
+
+# Secret redaction. Best effort: applied to commands and MCP inputs before anything is written.
+SECRET_KEY = r"(?:pass(?:word|wd|phrase)?|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|" \
+             r"client[_-]?secret|credentials?|authorization|auth[_-]?token|session[_-]?id|cookie|signature|sas[_-]?token)"
+SECRET_KEY_RE = re.compile(r"(?i)^[\w.-]*" + SECRET_KEY + r"[\w.-]*$")
+SECRET_PATTERNS = [
+    # Authorization headers first, so the generic key rule below doesn't stop at the word "Bearer"
+    (re.compile(r"(?i)((?:proxy-)?auth(?:orization)?\s*:\s*)(?:(?:bearer|basic|token|digest)\s+)?[^\s\"']+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)\bbearer\s+[\w.~+/=-]+"), "Bearer [REDACTED]"),
+    # "password": "x"  /  'api_key': 'x'  (JSON / dict style)
+    (re.compile(r"(?i)([\"']?[\w.-]*" + SECRET_KEY + r"[\w.-]*[\"']?\s*:\s*)([\"'])(?:\\.|(?!\2).)*\2"), r"\1\2[REDACTED]\2"),
+    # KEY=value, --password=value, password: value  (env, flags, yaml-ish)
+    (re.compile(r"(?i)((?:--?)?[\w.-]*" + SECRET_KEY + r"[\w.-]*\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|\S+)"), r"\1[REDACTED]"),
+    # --password value / --token value
+    (re.compile(r"(?i)(--?[\w-]*" + SECRET_KEY + r"[\w-]*\s+)(\"[^\"]*\"|'[^']*'|[^\s-]\S*)"), r"\1[REDACTED]"),
+    # credentials inside URLs: scheme://user:pass@host
+    (re.compile(r"([a-zA-Z][\w+.-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1[REDACTED]@"),
+    # curl -u user:pass / --user user:pass
+    (re.compile(r"((?:^|\s)(?:-u|--user)\s+)[^\s:]+:\S+"), r"\1[REDACTED]"),
+    # mysql -pSecret (password glued to -p)
+    (re.compile(r"(\bmysql\w*\b[^|;&\n]*?\s-p)(?!\s)\S+"), r"\1[REDACTED]"),
+    # Well-known token formats
+    (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}"), "[REDACTED]"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), "[REDACTED]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "[REDACTED]"),
+    (re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}"), "[REDACTED]"),
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "[REDACTED]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"), "[REDACTED]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "[REDACTED]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"), "[REDACTED PRIVATE KEY]"),
+]
 
 # Rule 2: a change in any of these fields is material and must be sealed with a changelog entry.
-FINGERPRINT_FIELDS = ["model", "task", "data_dependencies", "permissions", "access", "reports_to"]
+# kind/role/owner/auto_registered are included so they cannot be flipped quietly to dodge the rules.
+FINGERPRINT_FIELDS = ["model", "task", "data_dependencies", "permissions", "access", "reports_to",
+                      "owner", "kind", "role", "auto_registered"]
 
 REQUIRED_ALWAYS = ["agent_id", "name", "kind", "platform", "status", "created_at", "updated_at",
                    "owner", "task.purpose"]
@@ -133,12 +166,25 @@ TEMPLATE = {
 # ---------------------------------------------------------------- helpers
 
 def today():
+    """Date used for *checking* (review age). PASSPORT_TODAY may fake it for tests; it never affects
+    what gets written, so it cannot be used to backdate a review or a change."""
     forced = os.environ.get("PASSPORT_TODAY")
     return dt.date.fromisoformat(forced) if forced else dt.date.today()
 
 
+def stamp():
+    """Real date for everything that is written."""
+    return dt.date.today().isoformat()
+
+
 def now_iso():
-    return dt.datetime.now().isoformat(timespec="seconds")
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")  # with UTC offset
+
+
+def in_agent_session():
+    """True when this command runs inside an AI agent's shell (used to flag self-approval)."""
+    return any(os.environ.get(k) for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX",
+                                           "CURSOR_AGENT", "GEMINI_CLI", "PASSPORT_AGENT_SESSION"))
 
 
 def get(d, dotted):
@@ -232,11 +278,11 @@ def finding(level, agent_id, rule, message):
 
 
 def log(p, change, by):
-    p.setdefault("changelog", []).append({"date": today().isoformat(), "change": change, "by": by})
+    p.setdefault("changelog", []).append({"date": stamp(), "change": change, "by": by})
 
 
 def seal_passport(p, change, by):
-    p["updated_at"] = today().isoformat()
+    p["updated_at"] = stamp()
     p["fingerprint"] = fingerprint(p)
     log(p, change, by)
 
@@ -276,29 +322,64 @@ def _last_line(path):
     return lines[-1] if lines else None
 
 
-def _acquire_lock(root):
-    lock = root / ".activity.lock"
-    for _ in range(250):
-        try:
-            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-            return lock
-        except FileExistsError:
+class FileLock:
+    """Cross-process lock via an exclusive lock file. Hooks hold it for milliseconds, so a lock older
+    than `stale` seconds belongs to a crashed process and is taken over."""
+
+    def __init__(self, root, name, wait=20.0, stale=5.0):
+        self.path, self.wait, self.stale, self.held = root / name, wait, stale, False
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.time() + self.wait
+        while time.time() < deadline:
             try:
-                if time.time() - lock.stat().st_mtime > 10:  # stale lock from a crashed hook
-                    lock.unlink()
+                os.close(os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                self.held = True
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - self.path.stat().st_mtime > self.stale:
+                        self.path.unlink()
+                        continue
+                except OSError:
+                    pass
+                time.sleep(0.01)
+        return self
+
+    def __exit__(self, *exc):
+        if self.held:
+            try:
+                self.path.unlink()
             except OSError:
                 pass
-            time.sleep(0.02)
-    return None
+
+
+def log_head(path):
+    """(number of entries, hash of the last entry) of the activity log."""
+    if not path.exists():
+        return 0, "GENESIS"
+    count, head = 0, "GENESIS"
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            count += 1
+            try:
+                head = json.loads(line).get("hash") or hashlib.sha256(line.rstrip("\n").encode("utf-8")).hexdigest()
+            except ValueError:
+                head = hashlib.sha256(line.rstrip("\n").encode("utf-8")).hexdigest()
+    return count, head
 
 
 def activity(root, event, **fields):
-    """Append-only audit log. Every entry carries the hash of the previous one, so any later edit,
-    deletion or reordering breaks the chain and shows up in `passport.py verify`."""
+    """Append-only audit log. Every entry carries the hash of the previous one, so a later edit,
+    deletion or reordering breaks the chain. That detects changes, but anyone with write access can
+    recompute the whole chain; only anchors stored outside the agent's reach (see `anchor`) make
+    rewriting or truncating the log detectable."""
     root.mkdir(parents=True, exist_ok=True)
     path = root / "activity.jsonl"
-    lock = _acquire_lock(root)
-    try:
+    with FileLock(root, ".activity.lock") as lock:
         prev = "GENESIS"
         if path.exists():
             last = _last_line(path)
@@ -308,15 +389,49 @@ def activity(root, event, **fields):
                 except ValueError:
                     prev = hashlib.sha256(last.encode("utf-8")).hexdigest()
         entry = {"ts": now_iso(), "event": event, **fields, "prev": prev}
+        if not lock.held:
+            entry["lock"] = "timeout"  # written without the lock: a later chain break here is a race, not tampering
         entry["hash"] = entry_hash(entry)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    finally:
-        if lock:
-            try:
-                lock.unlink()
-            except OSError:
-                pass
+        data = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        try:
+            os.write(fd, data)  # one write call, so a line is never interleaved with another
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def anchor(root, reason, by=None):
+    """Record the current head of the log (count + hash) so truncation or a rewritten chain can be
+    detected later. Local anchors live in anchors.jsonl; copies sent to PASSPORT_ANCHOR_FILE
+    (e.g. a network share or synced folder the agent can't write to) or PASSPORT_ANCHOR_URL (a webhook,
+    SIEM or log collector) are what make it hold up against someone who can rewrite this folder."""
+    count, head = log_head(root / "activity.jsonl")
+    rec = {"ts": now_iso(), "project": project_root(root).name, "entries": count, "head": head,
+           "reason": reason, "by": by or ("agent session" if in_agent_session() else "human/CLI")}
+    line = json.dumps(rec, ensure_ascii=False) + "\n"
+    with open(root / "anchors.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(line)
+    sent = []
+    ext_file = os.environ.get("PASSPORT_ANCHOR_FILE")
+    if ext_file:
+        try:
+            with open(ext_file, "a", encoding="utf-8") as fh:
+                fh.write(line)
+            sent.append("file")
+        except OSError as e:
+            sent.append(f"file failed: {e}")
+    url = os.environ.get("PASSPORT_ANCHOR_URL")
+    if url:
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, data=line.encode("utf-8"), method="POST",
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5).close()
+            sent.append("url")
+        except Exception as e:  # noqa: BLE001 - anchoring must never break the agent
+            sent.append(f"url failed: {type(e).__name__}")
+    return rec, sent
 
 
 def read_activity(root):
@@ -333,7 +448,22 @@ def read_activity(root):
 
 
 def redact(text):
-    return SECRET_RE.sub("[REDACTED]", str(text or ""))
+    text = str(text or "")
+    for pattern, repl in SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def redact_obj(obj):
+    """Redact structured input (MCP arguments) by key name first, then by value pattern."""
+    if isinstance(obj, dict):
+        return {k: ("[REDACTED]" if SECRET_KEY_RE.match(str(k)) and v not in (None, "", [], {}) else redact_obj(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact_obj(v) for v in obj]
+    if isinstance(obj, str):
+        return redact(obj)
+    return obj
 
 
 def rel_to_project(root, file_path):
@@ -413,10 +543,23 @@ def validate(root):
     now = today()
     for aid, p in agents.items():
         status, kind = p.get("status"), p.get("kind")
-        auto = bool(p.get("auto_registered"))
-        # Auto-registered passports are created by a hook, not a person. Gaps are reported as
-        # warnings so they never block work, but they stay visible until a human completes them.
+        # Auto-registered passports are created by a hook, not a person. Their gaps are warnings so they
+        # never block work. That leniency only exists for subagent runs and the chief: setting the flag
+        # on any other passport is itself an error, so it can't be used to silence the rules.
+        flagged = bool(p.get("auto_registered"))
+        auto = flagged and (kind == "ephemeral" or p.get("role") == "chief")
+        if flagged and not auto:
+            findings.append(finding("ERROR", aid, "rule-1-no-passport-no-production",
+                                    "auto_registered is only valid for subagent runs and the chief; "
+                                    "this passport is checked as a normal one"))
         gap = "WARNING" if auto else "ERROR"
+        if p.get("role") == "chief" and not flagged and p.get("kind") != "persistent":
+            findings.append(finding("ERROR", aid, "identity", "the chief must be a persistent agent"))
+        rec = get(p, "review.recorded_from")
+        if rec == "agent session" and status not in TERMINAL:
+            findings.append(finding("WARNING", aid, "rule-3-quarterly-review",
+                                    "last review was recorded from inside an agent session; a human should "
+                                    "record it from their own terminal"))
         if not ID_RE.match(aid):
             findings.append(finding("ERROR", aid, "identity", "agent_id must look like AGT-0001"))
         if status not in STATUSES:
@@ -493,6 +636,23 @@ def validate(root):
     for rel in scan_definitions(root, agents):
         findings.append(finding("ERROR", "-", "rule-1-no-passport-no-production",
                                 f"agent definition {rel} has no passport (set definition_ref to link it)"))
+
+    chiefs = [aid for aid, p in agents.items() if p.get("role") == "chief" and p.get("status") not in TERMINAL]
+    if len(chiefs) > 1:
+        findings.append(finding("WARNING", "-", "identity",
+                                f"more than one active chief ({', '.join(chiefs)}); set the extras to ended"))
+
+    # Gaps in the trail itself.
+    errors_log = root / "hook-errors.log"
+    if errors_log.exists():
+        n = sum(1 for line in errors_log.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip())
+        if n:
+            findings.append(finding("WARNING", "-", "audit-trail",
+                                    f"{n} hook error(s) in hook-errors.log: the trail may be incomplete around those times"))
+    for e in read_activity(root):
+        if e.get("event") == "audit_log_edit":
+            findings.append(finding("WARNING", e.get("actor") or str(e.get("subagent_id")), "audit-trail",
+                                    f"{e.get('file')} was edited directly at {e.get('ts')}; run verify"))
     order = {"ERROR": 0, "WARNING": 1, "INFO": 2}
     findings.sort(key=lambda f: (order[f["level"]], f["agent_id"]))
     return agents, findings
@@ -508,12 +668,22 @@ def find_chief(agents):
 
 
 def ensure_chief(root, platform="claude-code"):
-    """The main session that talks to the user and spawns subagents. Created once per project."""
+    """The main session that talks to the user and spawns subagents. Created once per project.
+    Parallel hooks can race here, so the check-and-create happens under a lock."""
     agents, _ = load_all(root)
     chief = find_chief(agents)
     if chief:
         return chief
-    owner = os.environ.get("PASSPORT_OWNER") or git_user() or "unknown (set the accountable human)"
+    with FileLock(root, ".chief.lock"):
+        agents, _ = load_all(root)
+        chief = find_chief(agents)
+        if chief:
+            return chief
+        return _create_chief(root, platform)
+
+
+def _create_chief(root, platform):
+    owner =os.environ.get("PASSPORT_OWNER") or git_user() or "unknown (set the accountable human)"
     p = json.loads(json.dumps(TEMPLATE))
     p.update({
         "name": "chief",
@@ -524,8 +694,8 @@ def ensure_chief(root, platform="claude-code"):
         "invocable": True,
         "auto_registered": True,
         "how_to_invoke": "Open the agent tool (e.g. Claude Code) in this project and talk to it",
-        "created_at": today().isoformat(),
-        "updated_at": today().isoformat(),
+        "created_at": stamp(),
+        "updated_at": stamp(),
         "created_by": HOOK_BY,
         "owner": owner,
         "reports_to": owner,
@@ -582,8 +752,8 @@ def on_spawn(root, payload):
         "auto_registered": True,
         "instance_of": parent["agent_id"] if parent else None,
         "how_to_invoke": "Running; its result returns to the chief",
-        "created_at": today().isoformat(),
-        "updated_at": today().isoformat(),
+        "created_at": stamp(),
+        "updated_at": stamp(),
         "created_by": f"{chief['agent_id']} (session {str(sid)[:8]})",
         "owner": chief.get("owner"),
         "reports_to": chief["agent_id"],
@@ -641,7 +811,7 @@ def finish(root, p, result, status="ended", reason=None):
     else:
         p["invocable"] = False
         p["how_to_invoke"] = "No longer invocable"
-    p["updated_at"] = today().isoformat()
+    p["updated_at"] = stamp()
     log(p, f"status production -> {status}: " + clip(reason or result or "finished", 160), HOOK_BY)
     save(root, p)
     activity(root, status, agent_id=p["agent_id"], name=p.get("name"), task=get(p, "task.purpose"),
@@ -658,7 +828,18 @@ def on_spawn_done(root, payload):
     rt = p.setdefault("runtime", {})
     text = None
     if isinstance(resp, dict):
-        rt["agent_id"] = resp.get("agentId") or rt.get("agent_id")
+        real_id = resp.get("agentId")
+        if real_id:
+            # PostToolUse is matched by tool_use_id, so this mapping is authoritative. Undo any guess
+            # SubagentStart made for another passport with the same runtime id.
+            for other in agents.values():
+                if other is not p and get(other, "runtime.agent_id") == real_id:
+                    other["runtime"]["agent_id"] = None
+                    save(root, other)
+            rt["agent_id"] = real_id
+        pending = take_pending_stop(root, rt.get("agent_id"))
+        if pending:
+            rt["transcript"] = pending.get("agent_transcript_path")
         if resp.get("status") == "completed":  # a background launch returns at once; its numbers come later
             rt["tokens"] = resp.get("totalTokens")
             rt["duration_ms"] = resp.get("totalDurationMs") or payload.get("duration_ms")
@@ -675,27 +856,56 @@ def on_spawn_done(root, payload):
     else:
         text = str(resp or "")
         done = not rt.get("background")
+        pending = None
     save(root, p)
     if done:
         finish(root, p, text)
+    elif pending:  # the background run already stopped before we knew which passport it belonged to
+        finish(root, p, pending.get("last_assistant_message"))
     else:
         activity(root, "running", agent_id=p["agent_id"], name=p.get("name"), session_id=rt.get("session_id"),
                  note="started in the background")
 
 
 def on_subagent_start(root, payload):
+    """SubagentStart carries no tool_use_id, so it can only be matched by session + agent type.
+    Only link when exactly one run is waiting; otherwise PostToolUse makes the authoritative link."""
     agents, _ = load_all(root)
-    waiting = {aid: p for aid, p in agents.items() if not get(p, "runtime.agent_id")}
-    p = find_by_runtime(waiting, session_id=payload.get("session_id"), agent_type=payload.get("agent_type"))
-    if p and p.get("status") == "production":
-        p["runtime"]["agent_id"] = payload.get("agent_id")
-        save(root, p)
+    waiting = [p for p in agents.values()
+               if p.get("status") == "production" and not get(p, "runtime.agent_id")
+               and get(p, "runtime.session_id") == payload.get("session_id")
+               and get(p, "runtime.agent_type") == payload.get("agent_type")]
+    if len(waiting) == 1:
+        waiting[0]["runtime"]["agent_id"] = payload.get("agent_id")
+        save(root, waiting[0])
+
+
+def stash_pending_stop(root, payload):
+    d = root / ".pending"
+    d.mkdir(exist_ok=True)
+    keep = {k: payload.get(k) for k in ("agent_id", "agent_transcript_path", "last_assistant_message", "session_id")}
+    (d / f"{re.sub(r'[^A-Za-z0-9_-]', '_', str(payload.get('agent_id')))}.json").write_text(
+        json.dumps(keep, ensure_ascii=False), encoding="utf-8")
+
+
+def take_pending_stop(root, agent_id):
+    if not agent_id:
+        return None
+    f = root / ".pending" / f"{re.sub(r'[^A-Za-z0-9_-]', '_', str(agent_id))}.json"
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+        f.unlink()
+        return data
+    except (OSError, ValueError):
+        return None
 
 
 def on_subagent_stop(root, payload):
     agents, _ = load_all(root)
     p = find_by_runtime(agents, agent_id=payload.get("agent_id"))
     if not p:
+        # Not linked yet (parallel runs of the same type): keep it until PostToolUse links the run.
+        stash_pending_stop(root, payload)
         return
     rt = p["runtime"]
     rt["transcript"] = payload.get("agent_transcript_path")
@@ -748,14 +958,40 @@ def on_session_end(root, payload):
 
 
 def resolve_actor(root, payload):
-    """Tool calls made inside a subagent carry its agent_id; calls without one come from the chief."""
-    agents, _ = load_all(root)
+    """Tool calls made inside a subagent carry its runtime agent_id. That raw id is what gets stored;
+    it is resolved to a passport when the trail is read, after PostToolUse has made the authoritative
+    link. Calls without an agent_id come from the chief."""
     sub = payload.get("agent_id")
     if sub:
-        p = find_by_runtime(agents, agent_id=sub)
-        return (p["agent_id"] if p else None), sub
+        return None, sub
+    agents, _ = load_all(root)
     chief = find_chief(agents) or ensure_chief(root)
     return chief["agent_id"], None
+
+
+def is_protected(root, rel):
+    return bool(rel) and rel.startswith(root.name + "/") and rel.split("/")[-1] in PROTECTED_FILES
+
+
+def on_pre_tool(root, payload):
+    """Block direct edits to the audit log and anchors. Returns a deny decision or None.
+    Only passport.py itself appends to them."""
+    tool = payload.get("tool_name")
+    ti = payload.get("tool_input") or {}
+    if tool in FILE_TOOLS:
+        rel = rel_to_project(root, ti.get("file_path") or ti.get("notebook_path"))
+        if is_protected(root, rel):
+            return f"{rel} is the append-only audit trail; only passport.py may write to it."
+    elif tool in COMMAND_TOOLS:
+        cmd = str(ti.get("command") or "")
+        if any(name in cmd for name in PROTECTED_FILES) and "passport.py" not in cmd:
+            # Reading is fine; anything that could write, move or delete is not.
+            if re.search(r"(>|\brm\b|\bdel\b|\bmv\b|\bmove\b|\bcp\b|\bcopy\b|\bsed\b|\btruncate\b|Set-Content|Out-File|"
+                         r"Remove-Item|Clear-Content|Add-Content|\btee\b|\bperl\b|\bpython\b|\bnode\b|\bgit\s+(checkout|restore|rm|reset))",
+                         cmd, re.I):
+                return ("This command could modify the append-only audit trail (activity.jsonl / anchors.jsonl). "
+                        "Use passport.py commands instead.")
+    return None
 
 
 def on_tool_use(root, payload):
@@ -765,15 +1001,17 @@ def on_tool_use(root, payload):
     base = {"actor": actor, "subagent_id": sub, "session_id": payload.get("session_id"), "tool": tool}
     if tool in FILE_TOOLS:
         rel = rel_to_project(root, ti.get("file_path") or ti.get("notebook_path"))
-        if not rel or rel.startswith(root.name + "/"):
-            return  # the registry's own files are not part of the trail
+        if not rel:
+            return
         digest, size = file_digest(root, rel)
-        activity(root, "file_change", **base, file=rel, sha256=digest, bytes=size)
+        # Edits to passports are logged like any other file; an edit to the trail itself is flagged.
+        event = "audit_log_edit" if is_protected(root, rel) else "file_change"
+        activity(root, event, **base, file=rel, sha256=digest, bytes=size)
     elif tool.startswith("mcp__"):
         # Actions in external systems (CRM, mail, databases) through MCP servers.
         resp = payload.get("tool_response")
         failed = isinstance(resp, dict) and bool(resp.get("isError") or resp.get("is_error"))
-        activity(root, "command", **base, command=clip(redact(tool + " " + json.dumps(ti, ensure_ascii=False)), 300),
+        activity(root, "command", **base, command=clip(tool + " " + json.dumps(redact_obj(ti), ensure_ascii=False), 300),
                  description="external action via MCP", failed=failed)
     else:
         resp = payload.get("tool_response")
@@ -786,7 +1024,8 @@ def on_tool_use(root, payload):
 
 
 def cmd_hook(args):
-    """Never blocks or fails the agent: problems go to hook-errors.log."""
+    """Never fails the agent because of a registry problem: errors go to hook-errors.log and are
+    recorded in the trail as a gap. The only thing it ever blocks is a direct edit of the audit log."""
     root = root_dir(args)
     try:
         raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")  # hook payloads are UTF-8
@@ -794,6 +1033,16 @@ def cmd_hook(args):
         event = payload.get("hook_event_name")
         if not root.exists():
             (root / "passports").mkdir(parents=True, exist_ok=True)
+        if event == "PreToolUse" and payload.get("tool_name") in FILE_TOOLS | COMMAND_TOOLS:
+            reason = on_pre_tool(root, payload)
+            if reason:
+                actor, sub = resolve_actor(root, payload)
+                activity(root, "blocked", actor=actor, subagent_id=sub, session_id=payload.get("session_id"),
+                         tool=payload.get("tool_name"), reason=reason)
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                         "permissionDecision": "deny",
+                                                         "permissionDecisionReason": reason}}))
+            return
         if event == "PreToolUse" and payload.get("tool_name") in SPAWN_TOOLS:
             on_spawn(root, payload)
         elif event == "PostToolUse" and payload.get("tool_name") in SPAWN_TOOLS:
@@ -808,6 +1057,7 @@ def cmd_hook(args):
             on_subagent_stop(root, payload)
         elif event == "SessionEnd":
             on_session_end(root, payload)
+            anchor(root, "session end", by=HOOK_BY)
         else:
             return
         if event in {"PostToolUse", "SubagentStop", "SessionEnd"}:
@@ -816,7 +1066,9 @@ def cmd_hook(args):
         try:
             with open(root / "hook-errors.log", "a", encoding="utf-8") as fh:
                 fh.write(f"{now_iso()} {type(e).__name__}: {e}\n")
-        except OSError:
+            activity(root, "hook_error", error=f"{type(e).__name__}: {clip(str(e), 200)}",
+                     note="the trail may be incomplete around this time")
+        except Exception:  # noqa: BLE001
             pass
     sys.exit(0)
 
@@ -830,7 +1082,7 @@ def cmd_install_hooks(args):
     python = args.python or ("python" if os.name == "nt" else "python3")
     rel = root.relative_to(proj).as_posix()
     command = f'{python} "$CLAUDE_PROJECT_DIR/{rel}/passport.py" --dir "$CLAUDE_PROJECT_DIR/{rel}" hook'
-    wanted = {"PreToolUse": "Agent|Task",
+    wanted = {"PreToolUse": "|".join(sorted(TRACKED_TOOLS)),
               "PostToolUse": "|".join(sorted(TRACKED_TOOLS)) + "|mcp__.*",
               "SubagentStart": None, "SubagentStop": None, "SessionEnd": None}
     hooks = settings.setdefault("hooks", {})
@@ -882,7 +1134,7 @@ def cmd_new(args):
         p["reports_to"] = args.reports_to
     if args.role:
         p["role"] = args.role
-    p["created_at"] = p["updated_at"] = today().isoformat()
+    p["created_at"] = p["updated_at"] = stamp()
     p = create_passport(root, p)
     print(p["agent_id"])
     print(passport_path(root, p["agent_id"]))
@@ -898,7 +1150,7 @@ def cmd_spawn(args):
     p = json.loads(json.dumps(TEMPLATE))
     p.update({"name": args.name, "kind": "ephemeral", "platform": args.platform or parent.get("platform"),
               "status": "production", "invocable": True, "how_to_invoke": "Running; its result returns to " + parent["agent_id"],
-              "created_at": today().isoformat(), "updated_at": today().isoformat(),
+              "created_at": stamp(), "updated_at": stamp(),
               "created_by": args.by or parent["agent_id"], "owner": args.owner or parent.get("owner"),
               "reports_to": parent["agent_id"]})
     p["model"] = {"provider": args.provider or get(parent, "model.provider") or "unknown",
@@ -933,6 +1185,9 @@ def cmd_seal(args):
     p = load(root, args.agent_id)
     seal_passport(p, args.change, args.by)
     save(root, p)
+    # Every seal also lands in the hash-chained log with the real time, so changes can't be backdated.
+    activity(root, "seal", agent_id=args.agent_id, change=clip(args.change, 300), by=args.by,
+             fingerprint=p["fingerprint"], recorded_from="agent session" if in_agent_session() else "human shell")
     print(f"{args.agent_id} sealed ({p['fingerprint']})")
 
 
@@ -953,7 +1208,7 @@ def cmd_status(args):
             for f in errors:
                 print(f"  [{f['rule']}] {f['message']}")
             sys.exit(1)
-    p["updated_at"] = today().isoformat()
+    p["updated_at"] = stamp()
     log(p, f"status {old} -> {args.status}: {args.reason}", args.by)
     save(root, p)
     activity(root, "status", agent_id=args.agent_id, name=p.get("name"), change=f"{old} -> {args.status}",
@@ -976,14 +1231,23 @@ def validate_single(root, candidate):
 def cmd_review(args):
     root = root_dir(args)
     p = load(root, args.agent_id)
-    d = today()
+    d = dt.date.today()  # always the real date: a review cannot be backdated
+    agent = in_agent_session()
     p.setdefault("review", {})
     p["review"]["last_reviewed"] = d.isoformat()
     p["review"]["reviewed_by"] = args.by
     p["review"]["next_review_due"] = (d + dt.timedelta(days=REVIEW_DAYS)).isoformat()
+    # The reviewer name is self-declared. Record where the command ran so a review "signed" from
+    # inside an agent session is visible to validate and to auditors.
+    p["review"]["recorded_from"] = "agent session" if agent else "human shell"
     log(p, "quarterly review" + (f": {args.notes}" if args.notes else ""), args.by)
     save(root, p)
+    activity(root, "review", agent_id=args.agent_id, reviewer=args.by,
+             recorded_from=p["review"]["recorded_from"], notes=clip(args.notes, 200) or None)
     print(f"{args.agent_id} reviewed, next review due {p['review']['next_review_due']}")
+    if agent:
+        print("Note: this review was recorded from inside an agent session. Validation will flag it until a "
+              "human records the review from their own terminal.")
 
 
 def cmd_scan(args):
@@ -1149,10 +1413,14 @@ def file_ledger_entries(root, agents=None):
     by_sub = {get(p, "runtime.agent_id"): aid for aid, p in agents.items() if get(p, "runtime.agent_id")}
     out = []
     for e in read_activity(root):
-        if e.get("event") not in ("file_change", "command"):
+        if e.get("event") not in ("file_change", "audit_log_edit", "command"):
             continue
-        actor = e.get("actor") or by_sub.get(e.get("subagent_id")) or f"unresolved:{e.get('subagent_id')}"
-        out.append({"ts": e.get("ts"), "event": e["event"], "actor": actor,
+        sub = e.get("subagent_id")
+        # A subagent's raw runtime id is resolved now, using the link PostToolUse made by tool_use_id.
+        actor = (by_sub.get(sub) or f"unresolved:{sub}") if sub else (e.get("actor") or "unknown")
+        event = "file_change" if e["event"] == "audit_log_edit" else e["event"]
+        out.append({"ts": e.get("ts"), "event": event, "flag": "audit log edited" if e["event"] == "audit_log_edit" else None,
+                    "actor": actor,
                     "actor_name": (agents.get(actor) or {}).get("name"), "tool": e.get("tool"),
                     "file": e.get("file"), "sha256": e.get("sha256"), "command": e.get("command"),
                     "failed": e.get("failed"), "session": str(e.get("session_id") or "")[:8]})
@@ -1267,29 +1535,99 @@ def cmd_trace(args):
                   f"reports to {p.get('reports_to')}, owner {p.get('owner')}")
 
 
+def read_anchors(paths):
+    anchors = []
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        a = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(a, dict) and "entries" in a and "head" in a:
+                        a["_source"] = str(path)
+                        anchors.append(a)
+        except OSError:
+            continue
+    return anchors
+
+
 def cmd_verify(args):
-    """Check the hash chain of activity.jsonl: proves no entry was edited, removed or reordered."""
+    """Check the activity log's hash chain, then compare it with every anchor that can be found.
+    The chain alone catches edits by someone who did not recompute it; anchors kept outside this
+    folder also catch a recomputed chain, deleted entries at the end, or a deleted log."""
     root = root_dir(args)
     path = root / "activity.jsonl"
+    project = project_root(root).name
+    sources = [root / "anchors.jsonl"] + [Path(p) for p in (args.anchors or [])]
+    if os.environ.get("PASSPORT_ANCHOR_FILE"):
+        sources.append(Path(os.environ["PASSPORT_ANCHOR_FILE"]))
+    anchors = [a for a in read_anchors(sources) if a.get("project") in (None, project)]
+    for spec in args.head or []:
+        count, _, head = spec.partition(":")
+        anchors.append({"entries": int(count), "head": head, "_source": "--head"})
+    external = [a for a in anchors if a["_source"] != str(root / "anchors.jsonl")]
+
+    problems, forks, hashes = [], 0, []
     if not path.exists():
-        print("No activity log yet.")
-        return
-    prev, n, unchained = "GENESIS", 0, 0
-    for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        try:
-            e = json.loads(line)
-        except ValueError:
-            print(f"BROKEN at line {i}: not valid JSON")
-            sys.exit(1)
-        if "hash" not in e:
-            unchained += 1
-            prev = hashlib.sha256(line.encode("utf-8")).hexdigest()
-            continue
-        if e.get("prev") != prev or entry_hash(e) != e["hash"]:
-            print(f"BROKEN at line {i} ({e.get('ts')} {e.get('event')}): the log was changed after it was written.")
-            sys.exit(1)
-        prev, n = e["hash"], n + 1
-    print(f"Audit log intact: {n} chained entries" + (f", {unchained} older unchained entries" if unchained else "") + ".")
+        if any(a["entries"] > 0 for a in anchors):
+            problems.append("activity.jsonl is missing, but anchors show it had entries: the log was deleted")
+    else:
+        prev = "GENESIS"
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                problems.append(f"line {i}: not valid JSON (partial write or manual edit)")
+                prev = hashlib.sha256(line.encode("utf-8")).hexdigest()
+                hashes.append(prev)
+                continue
+            if "hash" not in e or "prev" not in e:
+                problems.append(f"line {i}: entry without hash chain (inserted or from an older format)")
+                prev = hashlib.sha256(line.encode("utf-8")).hexdigest()
+                hashes.append(prev)
+                continue
+            if entry_hash(e) != e["hash"]:
+                problems.append(f"line {i} ({e.get('ts')} {e.get('event')}): content changed after it was written")
+            elif e.get("prev") != prev:
+                if e.get("lock") == "timeout":
+                    forks += 1  # concurrent write without lock: a fork in the chain, not an edit
+                else:
+                    problems.append(f"line {i} ({e.get('ts')} {e.get('event')}): chain broken (entry removed, "
+                                    "inserted or reordered before this line)")
+            prev = e["hash"]
+            hashes.append(prev)
+        for a in anchors:
+            n = a["entries"]
+            where = f"anchor from {a.get('ts', '?')} ({Path(a['_source']).name})"
+            if n > len(hashes):
+                problems.append(f"{where} saw {n} entries, the log has {len(hashes)}: entries were removed from the end")
+            elif n > 0 and hashes[n - 1] != a["head"]:
+                problems.append(f"{where}: entry {n} does not match, the log was rewritten")
+
+    if problems:
+        print("AUDIT LOG NOT INTACT")
+        for p in problems:
+            print(f"  - {p}")
+        sys.exit(1)
+    print(f"Hash chain intact: {len(hashes)} entries" + (f" ({forks} concurrency forks, not edits)" if forks else "") + ".")
+    print(f"Anchors checked: {len(anchors)} ({len(external)} external).")
+    if not external:
+        print("Limit: without an anchor stored outside this folder, someone who can write here could rewrite the whole "
+              "log and recompute the chain. Set PASSPORT_ANCHOR_FILE or PASSPORT_ANCHOR_URL, or pass --head COUNT:HASH "
+              "from a record you trust.")
+
+
+def cmd_anchor(args):
+    root = root_dir(args)
+    rec, sent = anchor(root, args.reason or "manual anchor", by=args.by)
+    print(f"Anchored {rec['entries']} entries, head {rec['head'][:16]}... ({rec['ts']})")
+    print("Copies: " + (", ".join(sent) if sent else "local only (set PASSPORT_ANCHOR_FILE or PASSPORT_ANCHOR_URL "
+                                                     "for an external copy)"))
+    print(f"To check later against this record: passport.py verify --head {rec['entries']}:{rec['head']}")
 
 
 # ---------------------------------------------------------------- build outputs
@@ -1660,7 +1998,15 @@ def main():
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_trace)
 
-    sub.add_parser("verify", help="check the audit log's hash chain").set_defaults(fn=cmd_verify)
+    p = sub.add_parser("verify", help="check the audit log's hash chain against all known anchors")
+    p.add_argument("--anchors", nargs="*", help="extra anchor files (e.g. a copy kept outside the project)")
+    p.add_argument("--head", nargs="*", help="COUNT:HASH from a record you trust (repeatable)")
+    p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("anchor", help="record the log's current head (and send it out if configured)")
+    p.add_argument("--reason")
+    p.add_argument("--by")
+    p.set_defaults(fn=cmd_anchor)
 
     p = sub.add_parser("directory")
     p.add_argument("--json", action="store_true")
