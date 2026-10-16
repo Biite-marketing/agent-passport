@@ -1,0 +1,55 @@
+{
+  "skill_name": "agent-passport",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "In dit project draaien drie Claude Code subagents voor onze inbound sales (zie .claude/agents). Voordat we ze echt in productie zetten wil ik dat elke agent een paspoort heeft: wat doet hij, welk model, welke data, welke rechten, naar wie rapporteert hij. En maak een overzicht waarin ook de agents zelf kunnen zien wie ze kunnen aanspreken. Eigenaar van alles is Daan (sales ops).",
+      "expected_output": "agent-passports/ with one complete passport per subagent (3), registry outputs (json/md/html), relationships lead-qualifier -> email-drafter -> crm-updater, HubSpot personal data noted, human handoff (Lisa, salesperson sends drafts), unknowns (exact model version, hosting region) flagged rather than invented, validation run.",
+      "files": [
+        "fixtures/sales-agents"
+      ],
+      "assertions": [
+        "Each of the 3 subagents (lead-qualifier, email-drafter, crm-updater) has its own passport record",
+        "Every passport states model, data sources, tools/permissions and who it reports to",
+        "HubSpot lead data is flagged as personal data",
+        "Human handoffs are recorded (Lisa for existing customers; a salesperson sends the drafts)",
+        "Unknown facts (exact model version, hosting region) are marked unknown instead of invented",
+        "A machine-readable directory/registry exists that agents can read to see who they can call",
+        "Agents are not marked production while required facts are missing (validation/gate applied)",
+        "The final reply tells the user which open points remain before production"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "We hebben de invoice-checker agent vandaag omgezet van claude-sonnet-5-5 naar gpt-5.1 via de OpenAI API (US-hosted). Daarnaast leest hij nu ook klantgegevens uit Salesforce om debiteuren te matchen. Kun je de administratie van de agents bijwerken? Sanne heeft dit goedgekeurd.",
+      "expected_output": "AGT-0002 passport updated: model provider/name/version/region, eu_hosted false, new Salesforce data dependency with personal data, changelog entry by Sanne, re-sealed so validation passes, data-residency risk surfaced to the user, registry rebuilt.",
+      "files": [
+        "fixtures/finance-agents"
+      ],
+      "assertions": [
+        "invoice-checker passport now shows OpenAI gpt-5.1 hosted in the US / not EU",
+        "Salesforce is added as data dependency and marked as containing personal data",
+        "A dated change record (2026-10-16) names the change and Sanne's approval",
+        "The previous model (claude-sonnet-5-5) remains traceable in history",
+        "Passport validation passes after the update (passport.py validate exits 0)",
+        "The final reply warns about personal data processed outside the EU"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Als orchestrator (AGT-0001) wil ik twee tijdelijke subagents inzetten: eentje die de openstaande facturen van Q3 uit invoices/ samenvat en eentje die op het web de betaaltermijnen van onze top-5 leveranciers opzoekt. Regel dit volgens onze agent-afspraken: zorg dat ze geregistreerd zijn voordat ze starten en netjes afgesloten worden. Je hoeft ze niet echt te spawnen; simuleer dat ze klaar zijn en hun werk hebben opgeleverd. Daan heeft dit gevraagd.",
+      "expected_output": "Two ephemeral passports created before 'spawn', with exact tools/data/permissions (one reads invoices/ incl. personal data, one web-only), reports_to AGT-0001, owner Daan, promoted to production via validation, then ended with reasons; registry shows them non-invocable; validation clean.",
+      "files": [
+        "fixtures/finance-agents"
+      ],
+      "assertions": [
+        "Two new passports exist, one per temporary subagent",
+        "Both are marked as ephemeral/temporary and report to AGT-0001 with Daan as owner",
+        "Permissions differ correctly: invoice summariser reads invoices/ (personal data), web researcher has web-only access",
+        "History shows registration before start and a closing entry (ended) with what was delivered",
+        "Both subagents end non-invocable (or explicitly documented how to resume)",
+        "Passport validation passes at the end (passport.py validate exits 0)"
+      ]
+    }
+  ]
+}
