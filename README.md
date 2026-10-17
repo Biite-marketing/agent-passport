@@ -65,20 +65,26 @@ register agents with two commands (`spawn` / `end`).
 
 Examples from a fictional demo project.
 
-**Organogram**: the accountable human, the chief (main session), persistent agents and every subagent run. Click
-an agent for its passport.
+Examples from a fictional busy project: one chief, 324 subagent runs over 10 days.
+
+**Organogram**: structure first. Runs are folded into one card per subagent role, with counters for the selected period.
 
 ![Organogram](docs/organogram.png)
 
-**Who did what**: every subagent run with task, model, duration and result.
+**Timeline**: one block per work session. Each role gets a lane, parallel runs are stacked, and stopped runs are outlined in red.
 
-![Who did what](docs/who-did-what.png)
+![Timeline](docs/timeline.png)
 
-**Files**: which agent changed which file, linked read-only to the graphify cluster it belongs to.
+**Where agents work**: graphify clusters (or folders) against agent roles. It shows which parts of the project each role changed.
 
-![Files](docs/files.png)
+![Where agents work](docs/map.png)
 
-Deep links work too: `registry.html#files`, `#act`, `#AGT-0004` or `#file=src/scoring.py`.
+**Runs**: a searchable, sortable table with CSV export. Click a run for its full trail: task, model, files with hashes, commands and result.
+
+![Runs](docs/runs.png)
+
+A period selector (24 h · 7 days · 30 days · quarter · all) applies to every view. Deep links such as `registry.html#time`, `#map`,
+`#AGT-0042` or `#file=src/scoring.py` open a view directly.
 
 ## Quick start (in a project)
 
@@ -94,7 +100,7 @@ python agent-passports/passport.py build              # organogram: agent-passpo
 Useful afterwards:
 
 ```bash
-python agent-passports/passport.py report --since today   # who did what
+python agent-passports/passport.py report --summary --since today   # who did what, per role (short)
 python agent-passports/passport.py trace src/auth.py      # audit: who changed this file
 python agent-passports/passport.py verify                 # audit log intact?
 python agent-passports/passport.py validate               # rules check (exit 1 on errors, CI-friendly)

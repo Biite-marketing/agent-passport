@@ -27,7 +27,7 @@ agent-passports/
 ├── activity.jsonl            hash-chained audit log: spawns, endings, status changes, seals, reviews, file changes
 │                             (with file hash), commands and external MCP actions, each tied to an agent
 ├── anchors.jsonl             checkpoints of the log's head (count + hash), written at every session end
-├── registry.html             the organogram: click an agent for its passport and a ready-to-paste message
+├── registry.html             the organogram for humans: roles, runs table, session timeline, where agents work
 ├── REGISTRY.md               the same in text: findings, directory, who did what, every passport
 ├── registry.json             machine-readable directory for agents: who exists, who may call whom
 ├── passport.py               the tool (Python, no dependencies), copied in so any LLM, hook or CI can run it
@@ -56,7 +56,8 @@ Before `init`, call `<skill-dir>/scripts/passport.py`. After `init`, use `agent-
 | `seal ID --change "..." --by WHO` | after every material edit: fingerprint, date, changelog |
 | `status ID STATUS --reason "..." --by WHO` | lifecycle; `production` is refused while the passport is incomplete |
 | `review ID --by NAME [--notes]` | record the quarterly review |
-| `report [--since today\|YYYY-MM-DD] [--session ID]` | **who did what**: every subagent run with task, model, tools, time, tokens and result |
+| `report --summary [--since today\|YYYY-MM-DD]` | **who did what, in short**: runs, tokens and files per role. Start here |
+| `report [--since …] [--session ID]` | every run in detail: task, model, tools, time, tokens, files, result |
 | `trace <file\|folder\|graphify cluster>` | **audit**: who changed it, when, with which tool, file hash after the change, related files in the graphify graph, and the passports of the agents involved |
 | `verify [--head COUNT:HASH] [--anchors FILE]` | check the hash chain and compare it with every anchor: detects edits, and with an external anchor also a rewritten, truncated or deleted log |
 | `anchor [--reason]` | record the log's current head now (also sent to `PASSPORT_ANCHOR_FILE` / `PASSPORT_ANCHOR_URL` if set) |
@@ -98,7 +99,21 @@ Afterwards you can still enrich an auto-registered passport, for example by addi
 
 ### "Who did what?"
 
-When the user asks what agents did, which subagent touched what, or for a status report, run `report --since today` (or `--since <date>`, or `--session <id>`). Answer from it: which agent, which task, on which model, with which tools, how long, and what it delivered. Point to `registry.html` → "Who did what" for the visual version. Don't reconstruct this from memory; the log is the source of truth.
+When the user asks what agents did, which subagent touched what, or for a status report, start with `report --summary --since today` (or another date). It stays a few lines however many runs there were. Only drill down with `report --session <id>` or `trace <file>` when the question needs it. Don't reconstruct this from memory; the log is the source of truth.
+
+For the visual overview, point the user to `agent-passports/registry.html`. It is made for people, not for you, so don't read it yourself. It has these views:
+- **Organogram:** the structure. Runs are folded into one card per subagent role, with counters, so a chief with hundreds of runs stays one readable tree.
+- **Runs:** a searchable, sortable table of every run, with CSV export.
+- **Timeline:** one block per work session, with a lane per role and parallel runs stacked.
+- **Where agents work:** a matrix of graphify clusters (or folders) against agent roles.
+- **Files**, **Commands** and **Findings.**
+
+A period selector (24 h, 7 days, 30 days, quarter, all) applies to every view. Clicking a run opens its full trail: task, model, files with hashes, commands and result. Deep links such as `registry.html#time`, `#map` or `#AGT-0042` open a view directly.
+
+**Keep it cheap.** This skill is for oversight, so it should cost almost nothing per run:
+- Registration and the page are produced by the script, not by you.
+- During busy sessions the page is rebuilt at most every 30 seconds, and always at session end.
+- Don't open `registry.json`, `REGISTRY.md` or `activity.jsonl` to answer questions. Use `report --summary`, `directory` or `trace`, which print only what is needed.
 
 ### Audits and incidents: "what went wrong, where, and which agent did it?"
 
@@ -139,7 +154,7 @@ Edit the passport JSON (and the agent itself), then `seal ID --change "<what cha
 
 ### Working in a multi-agent setup: who can I talk to?
 
-Before handing work to another agent, read `agent-passports/registry.json` (`directory`) or run `directory`. Only call agents that are `invocable`, whose `who_can_invoke` includes you or your role, and whose task and interface fit the request. If you need an agent that isn't there, don't improvise a hidden one: either let the hook register it by spawning normally, or create a passport first. Mention your AGT-id when you hand off work so the trail connects.
+Before handing work to another agent, run `directory`. It lists only the agents that can be called now, so it stays short even after thousands of runs. Only call agents that are `invocable`, whose `who_can_invoke` includes you or your role, and whose task and interface fit the request. If you need an agent that isn't there, don't improvise a hidden one: either let the hook register it by spawning normally, or create a passport first. Mention your AGT-id when you hand off work so the trail connects.
 
 ## Always finish with
 

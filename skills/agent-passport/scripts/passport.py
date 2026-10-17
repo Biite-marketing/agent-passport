@@ -1066,7 +1066,7 @@ def cmd_hook(args):
         else:
             return
         if event in {"PostToolUse", "SubagentStop", "SessionEnd"}:
-            write_outputs(root)
+            write_outputs(root, force=(event == "SessionEnd"))
     except Exception as e:  # noqa: BLE001 - a registry problem must never break the user's work
         try:
             with open(root / "hook-errors.log", "a", encoding="utf-8") as fh:
@@ -1422,7 +1422,7 @@ def report_rows(root, since=None, session=None):
             "model": rt.get("resolved_model") or get(p, "model.name"),
             "tools": get(p, "permissions.tools"), "duration_s": round(rt["duration_ms"] / 1000) if rt.get("duration_ms") else None,
             "tokens": rt.get("tokens"), "result": rt.get("result_summary"), "session": str(rt.get("session_id") or "")[:8],
-            "files": sorted(set(touched.get(aid, []))),
+            "files": sorted(set(touched.get(aid, []))), "role": role_of(p, agents),
         })
     rows.sort(key=lambda r: r["started"])
     changes = []
@@ -1465,12 +1465,36 @@ def render_report(rows, changes, since=None):
     return "\n".join(out) + "\n"
 
 
+def render_summary(rows, since=None):
+    roles = {}
+    for r in rows:
+        g = roles.setdefault(r["role"], {"runs": 0, "running": 0, "stopped": 0, "tokens": 0, "files": set(), "last": ""})
+        g["runs"] += 1
+        g["running"] += r["status"] == "production"
+        g["stopped"] += r["status"] == "killed"
+        g["tokens"] += r["tokens"] or 0
+        g["files"].update(r["files"])
+        g["last"] = max(g["last"], r["started"] or "")
+    sessions = {r["session"] for r in rows if r["session"]}
+    out = [f"Agent activity summary{' since ' + since if since else ''}: {len(rows)} subagent runs, "
+           f"{len(roles)} roles, {len(sessions)} sessions.", "",
+           "| Role | Runs | Running | Stopped | Tokens | Files changed | Last run |", "|---|---|---|---|---|---|---|"]
+    for role, g in sorted(roles.items(), key=lambda kv: -kv[1]["runs"]):
+        out.append(f"| {md_value(role)} | {g['runs']} | {g['running']} | {g['stopped']} | {g['tokens']} | "
+                   f"{len(g['files'])} | {g['last'][:16].replace('T', ' ')} |")
+    out += ["", "Details per run: `report --since <date>` or open agent-passports/registry.html."]
+    return "\n".join(out) + "\n"
+
+
 def cmd_report(args):
     root = root_dir(args)
     since = args.since
     if since == "today":
         since = today().isoformat()
     rows, changes = report_rows(root, since, args.session)
+    if args.summary:
+        print(render_summary(rows, since))
+        return
     if args.json:
         print(json.dumps({"runs": rows, "changes": changes}, indent=2, ensure_ascii=False))
     else:
@@ -1705,7 +1729,16 @@ def cmd_anchor(args):
 
 # ---------------------------------------------------------------- build outputs
 
-def write_outputs(root):
+BUILD_INTERVAL = 30  # seconds: during busy sessions the page is rebuilt at most this often
+
+
+def write_outputs(root, force=True):
+    if not force:
+        try:
+            if time.time() - (root / "registry.html").stat().st_mtime < BUILD_INTERVAL:
+                return None
+        except OSError:
+            pass
     agents, findings = validate(root)
     counts = {s: sum(1 for p in agents.values() if p.get("status") == s) for s in STATUSES}
     runs, changes = report_rows(root)
@@ -1720,7 +1753,8 @@ def write_outputs(root):
         "summary": {"agents": len(agents), "by_status": counts,
                     "errors": sum(f["level"] == "ERROR" for f in findings),
                     "warnings": sum(f["level"] == "WARNING" for f in findings)},
-        "directory": directory_entries(agents),
+        # Agents read this to find who they can call: finished subagent runs are left out to keep it small.
+        "directory": [d for d in directory_entries(agents) if d["kind"] != "ephemeral" or d["invocable"]],
         "edges": build_edges(agents),
         "findings": findings,
         "activity": runs[-200:],
@@ -1731,7 +1765,7 @@ def write_outputs(root):
     }
     (root / "registry.json").write_text(json.dumps(registry, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (root / "REGISTRY.md").write_text(render_markdown(registry, runs, changes), encoding="utf-8")
-    (root / "registry.html").write_text(render_html(registry), encoding="utf-8")
+    (root / "registry.html").write_text(render_html(dict(registry, _root=root), agents, gi), encoding="utf-8")
     return registry
 
 
@@ -1844,10 +1878,64 @@ def render_markdown(reg, runs, changes):
     return "\n".join(out) + "\n"
 
 
-def render_html(reg):
-    data = json.dumps({"summary": reg["summary"], "findings": reg["findings"], "activity": reg["activity"],
-                       "files": reg["files"], "commands": reg["commands"], "graphify": reg["graphify"],
-                       "passports": reg["passports"], "generated_at": reg["generated_at"]}, ensure_ascii=False)
+def role_of(p, agents):
+    """Runs are grouped by role: the persistent agent they are an instance of, else their agent type."""
+    inst = p.get("instance_of")
+    if inst and inst in agents:
+        return agents[inst].get("name") or inst
+    return get(p, "runtime.agent_type") or p.get("name") or "subagent"
+
+
+def view_data(reg, agents, gi):
+    """Compact data for the organogram page. Runs and events are kept small so the page stays fast with
+    thousands of runs; all grouping, period filtering and charts are done in the browser."""
+    persistent, runs = {}, []
+    for aid, p in sorted(agents.items()):
+        if p.get("kind") == "ephemeral":
+            rt = p.get("runtime") or {}
+            tools = get(p, "permissions.tools")
+            deps = p.get("data_dependencies")
+            runs.append({
+                "id": aid, "role": role_of(p, agents), "inst": p.get("instance_of"), "parent": p.get("reports_to"),
+                "task": get(p, "task.purpose"), "prompt": clip((get(p, "task.in_scope") or [""])[0], 300),
+                "status": p.get("status"), "inv": bool(p.get("invocable")) and bool(rt.get("agent_id")),
+                "session": str(rt.get("session_id") or "")[:8], "start": rt.get("started_at") or p.get("created_at"),
+                "end": rt.get("ended_at"), "ms": rt.get("duration_ms"), "tok": rt.get("tokens"),
+                "model": rt.get("resolved_model") or get(p, "model.name"),
+                "tools": ", ".join(tools) if isinstance(tools, list) else tools,
+                "data": "; ".join(d.get("source", "") if isinstance(d, dict) else str(d) for d in deps) if isinstance(deps, list) else deps,
+                "owner": p.get("owner"), "transcript": rt.get("transcript"), "result": clip(rt.get("result_summary"), 500),
+                "agent": rt.get("agent_id"), "how": p.get("how_to_invoke"), "auto": bool(p.get("auto_registered")),
+            })
+        else:
+            q = {k: v for k, v in p.items() if not k.startswith("_")}
+            q["changelog"] = (q.get("changelog") or [])[-8:]
+            persistent[aid] = q
+    events, gfiles = [], {}
+    for t in file_ledger_entries(reg["_root"], agents):
+        e = {"t": t["ts"], "a": t["actor"], "k": "f" if t["event"] == "file_change" else "c", "tool": t["tool"],
+             "s": str(t.get("session") or "")}
+        if e["k"] == "f":
+            e["p"] = t["file"]
+            e["sha"] = (t["sha256"] or "")[:12]
+            if t.get("flag"):
+                e["flag"] = t["flag"]
+            if gi and t["file"] in gi["files"] and t["file"] not in gfiles:
+                g = gi["files"][t["file"]]
+                gfiles[t["file"]] = {"c": sorted(set(g["communities"].values())), "n": g["nodes"][:8],
+                                     "r": (gi["related"].get(t["file"]) or [])[:10]}
+        else:
+            e["p"] = t["command"]
+            e["fail"] = t["failed"]
+        events.append(e)
+    return {"generated_at": reg["generated_at"], "project": project_root(reg["_root"]).name,
+            "summary": reg["summary"], "findings": reg["findings"], "persistent": persistent, "runs": runs,
+            "events": events, "graph": gfiles,
+            "graphify": {"path": gi["path"], "built_at": gi["built_at"]} if gi else None}
+
+
+def render_html(reg, agents, gi):
+    data = json.dumps(view_data(reg, agents, gi), ensure_ascii=False, separators=(",", ":"))
     data = data.replace("</", "<\\/")
     return HTML_TEMPLATE.replace("__DATA__", data).replace("__TITLE__", html.escape("Agent Organogram"))
 
@@ -1856,21 +1944,29 @@ HTML_TEMPLATE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__</title>
 <style>
-:root{--bg:#f6f5f1;--panel:#fff;--ink:#1d1d1b;--muted:#6d6c66;--line:#d6d4cc;--accent:#2f6fde;
---development:#6f8fd8;--test:#d39a2c;--production:#2b9466;--suspended:#c9663b;--killed:#8f8e88;--ended:#aaa9a3;--human:#7c55c0}
-@media (prefers-color-scheme:dark){:root{--bg:#131312;--panel:#1d1d1b;--ink:#ecebe5;--muted:#9d9c95;--line:#36352f;--accent:#7aa5f0}}
+:root{--bg:#f6f5f1;--panel:#fff;--ink:#1d1d1b;--muted:#6d6c66;--line:#dedcd4;--soft:#efede6;--accent:#2f6fde;--heat:255,87,87;
+--development:#6f8fd8;--test:#d39a2c;--production:#2b9466;--suspended:#c9663b;--killed:#c4423a;--ended:#9a9993;--human:#7c55c0}
+@media (prefers-color-scheme:dark){:root{--bg:#131312;--panel:#1d1d1b;--ink:#ecebe5;--muted:#9d9c95;--line:#36352f;--soft:#26251f;--accent:#7aa5f0}}
 *{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,sans-serif}
-header{padding:14px 16px 0;border-bottom:1px solid var(--line);background:var(--panel)}
-h1{font-size:18px;margin:0 0 2px}.muted{color:var(--muted)}.err{color:#cf3f35;font-weight:600}
-nav{display:flex;gap:4px;margin-top:10px}nav button{border:0;background:none;color:var(--muted);padding:8px 12px;font:inherit;cursor:pointer;border-bottom:2px solid transparent}
+header{padding:14px 18px 0;border-bottom:1px solid var(--line);background:var(--panel)}
+.top{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:baseline;justify-content:space-between}
+h1{font-size:18px;margin:0}.muted{color:var(--muted)}
+.kpis{display:flex;flex-wrap:wrap;gap:8px}.kpi{background:var(--soft);border-radius:8px;padding:4px 10px;font-size:13px}.kpi b{font-size:15px;margin-right:4px}
+select,input{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:5px 8px}
+nav{display:flex;gap:2px;margin-top:10px;overflow-x:auto}nav button{border:0;background:none;color:var(--muted);padding:8px 12px;font:inherit;cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap}
 nav button.on{color:var(--ink);border-bottom-color:var(--accent);font-weight:600}
-main{display:grid;grid-template-columns:1fr 380px;min-height:calc(100vh - 92px)}
-@media (max-width:860px){main{grid-template-columns:1fr}}
-section{padding:20px 16px;overflow:auto}section[hidden]{display:none}
-aside{border-left:1px solid var(--line);background:var(--panel);padding:16px;overflow:auto;max-height:calc(100vh - 92px);position:sticky;top:0}
-@media (max-width:860px){aside{border-left:0;border-top:1px solid var(--line);max-height:none;position:static}}
-/* organogram */
-.tree{display:flex;justify-content:center;min-width:max-content;padding-bottom:24px}
+main{display:grid;grid-template-columns:1fr 400px;min-height:calc(100vh - 100px)}
+@media (max-width:900px){main{grid-template-columns:1fr}}
+section{padding:18px;overflow:auto;min-width:0}section[hidden]{display:none}
+aside{border-left:1px solid var(--line);background:var(--panel);padding:16px;overflow:auto;max-height:calc(100vh - 100px);position:sticky;top:0}
+@media (max-width:900px){aside{border-left:0;border-top:1px solid var(--line);max-height:none;position:static}}
+aside h2{font-size:16px;margin:0 0 2px}aside h3{font-size:13px;margin:16px 0 6px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+aside dl{margin:6px 0 0}aside dt{color:var(--muted);font-size:11.5px;margin-top:8px;text-transform:uppercase;letter-spacing:.03em}aside dd{margin:2px 0 0;word-break:break-word}
+a,.link{color:var(--accent);cursor:pointer;text-decoration:none}
+/* tree */
+.tree{display:flex;width:max-content;min-width:100%;justify-content:center;margin:0 auto;padding-bottom:24px}
+.roles{display:grid;grid-template-columns:repeat(var(--cols,3),210px);gap:10px;padding:12px;border:1px dashed var(--line);border-radius:12px;background:color-mix(in srgb,var(--panel) 55%,transparent)}
+.roles-hd{grid-column:1/-1;font-size:12px;color:var(--muted)}
 .tree ul{display:flex;justify-content:center;padding:22px 0 0;margin:0;position:relative}
 .tree li{list-style:none;position:relative;padding:22px 8px 0;display:flex;flex-direction:column;align-items:center}
 .tree>ul{padding-top:0}.tree>ul>li{padding-top:0}
@@ -1881,84 +1977,196 @@ aside{border-left:1px solid var(--line);background:var(--panel);padding:16px;ove
 .tree li:last-child::before{border-right:1.5px solid var(--line)}
 .tree>ul>li::before,.tree>ul>li::after{display:none}
 .tree ul ul::before{content:"";position:absolute;top:0;left:50%;height:22px;border-left:1.5px solid var(--line)}
-.card{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--c,var(--line));border-radius:8px;padding:8px 12px;min-width:150px;max-width:220px;text-align:left;cursor:pointer;font:inherit;color:inherit}
-.card:hover,.card.sel{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 25%,transparent)}
+.card{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--c,var(--line));border-radius:9px;padding:8px 12px;width:210px;text-align:left;cursor:pointer;font:inherit;color:inherit}
+.card:hover,.card.sel{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 22%,transparent)}
 .card b{display:block;font-size:13px}.card small{display:block;color:var(--muted);font-size:11.5px;line-height:1.35}
-.card.human{border-left-color:var(--human);cursor:default;background:color-mix(in srgb,var(--human) 8%,var(--panel))}
-.card.off{opacity:.6}.pill{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:9px;background:color-mix(in srgb,var(--c) 18%,transparent);color:var(--ink);margin-top:3px}
-.group{border:1px dashed var(--line);border-radius:8px;padding:6px 8px;background:color-mix(in srgb,var(--panel) 60%,transparent);max-width:240px}
-.group summary{cursor:pointer;font-size:12.5px;color:var(--muted)}.group .card{margin-top:6px;min-width:0;max-width:none}
-.legend{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px;font-size:12px;color:var(--muted)}.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
-table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:600;font-size:12px}
-tr.click{cursor:pointer}tr.click:hover{background:color-mix(in srgb,var(--accent) 7%,transparent)}
-aside h2{font-size:16px;margin:0 0 4px}aside dl{margin:10px 0 0}aside dt{color:var(--muted);font-size:11.5px;margin-top:9px;text-transform:uppercase;letter-spacing:.03em}aside dd{margin:2px 0 0;word-break:break-word}aside a{color:var(--accent)}
+.card.human{border-left-color:var(--human);cursor:default}.card.idle{opacity:.55}
+.role{border-style:dashed;border-left-style:solid;--c:var(--accent)}
+.stats{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}.st{font-size:11px;padding:1px 7px;border-radius:9px;background:var(--soft)}
+.st.run{background:color-mix(in srgb,var(--production) 22%,transparent)}.st.bad{background:color-mix(in srgb,var(--killed) 22%,transparent)}
+.pill{display:inline-block;font-size:11px;padding:1px 8px;border-radius:9px;background:color-mix(in srgb,var(--c) 20%,transparent)}
+/* tables */
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12px;cursor:pointer;white-space:nowrap;user-select:none}th.sorted::after{content:" ▾"}th.sorted.asc::after{content:" ▴"}
+tr.click{cursor:pointer}tr.click:hover{background:color-mix(in srgb,var(--accent) 6%,transparent)}
+td.num{text-align:right;font-variant-numeric:tabular-nums}code{font-size:12px}
+.btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:7px;padding:5px 10px;font:inherit;cursor:pointer}
+.btn:hover{border-color:var(--accent)}.btn.pri{background:var(--accent);border-color:var(--accent);color:#fff}
+/* timeline */
+.sess{border:1px solid var(--line);border-radius:10px;background:var(--panel);margin-bottom:14px;overflow:hidden}
+.sess .hd{display:flex;flex-wrap:wrap;gap:6px 16px;padding:9px 12px;border-bottom:1px solid var(--line);background:var(--soft);font-size:13px}
+.lanes{padding:8px 12px 12px}.lane{display:grid;grid-template-columns:150px 1fr;align-items:center;gap:8px;min-height:24px}
+.lane .nm{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.track{position:relative;height:20px;background:repeating-linear-gradient(90deg,transparent 0 calc(10% - 1px),var(--line) calc(10% - 1px) 10%);border-radius:4px}
+.blk{position:absolute;top:2px;height:10px;border-radius:3px;background:var(--c);opacity:.8;cursor:pointer;min-width:3px}
+.blk.bad{outline:2px solid var(--killed);opacity:1}.blk.live{outline:2px solid var(--production);opacity:1}
+.blk:hover,.blk.sel{opacity:1;outline:2px solid var(--ink)}
+.axis{display:grid;grid-template-columns:150px 1fr;gap:8px;font-size:11px;color:var(--muted)}.axis div:last-child{display:flex;justify-content:space-between}
+/* map */
+.heat td.cell{text-align:center;cursor:pointer;min-width:62px;font-variant-numeric:tabular-nums}
+.heat th.col{writing-mode:vertical-rl;transform:rotate(180deg);height:120px;vertical-align:bottom;text-align:left}
+.lvl-ERROR{color:#cf3f35;font-weight:600}.lvl-WARNING{color:#b9801b;font-weight:600}
 .talk{margin:12px 0 4px;padding:10px;border:1px solid var(--line);border-radius:8px}
-.talk textarea{width:100%;min-height:70px;font:12.5px ui-monospace,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px}
-.btn{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:7px 12px;font:inherit;font-weight:600;cursor:pointer;margin-top:6px}.btn[disabled]{opacity:.45;cursor:not-allowed}
-.f{font-size:12.5px;margin:4px 0}.lvl-ERROR{color:#cf3f35;font-weight:600}.lvl-WARNING{color:#b9801b;font-weight:600}
-</style></head><body>
-<header><h1>Agent Organogram</h1><div class="muted" id="sum"></div>
-<nav><button class="on" data-tab="org">Organogram</button><button data-tab="act">Who did what</button><button data-tab="files">Files</button><button data-tab="cmd">Commands</button><button data-tab="fin">Findings</button></nav></header>
+.talk textarea{width:100%;min-height:62px;font:12px ui-monospace,monospace;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px}
+.list div{padding:5px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+.legend{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 14px;font-size:12px;color:var(--muted)}.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+</style></head>
+<body>
+<header><div class="top"><div><h1>Agent Organogram</h1><div class="muted" id="sub"></div></div>
+<div class="kpis" id="kpis"></div>
+<label class="muted">Period <select id="period"><option value="1">Last 24 hours</option><option value="7" selected>Last 7 days</option><option value="30">Last 30 days</option><option value="q">This quarter</option><option value="all">All time</option></select></label></div>
+<nav id="nav"><button data-tab="org" class="on">Organogram</button><button data-tab="runs">Runs</button><button data-tab="time">Timeline</button><button data-tab="map">Where agents work</button><button data-tab="files">Files</button><button data-tab="cmd">Commands</button><button data-tab="fin">Findings</button></nav></header>
 <main>
-<section id="org"><div class="legend" id="legend"></div><div class="tree" id="tree"></div></section>
-<section id="act" hidden></section>
-<section id="files" hidden></section>
-<section id="cmd" hidden></section>
-<section id="fin" hidden></section>
-<aside id="side"><h2>Select an agent</h2><p class="muted">Click any card to see its passport: what it does, which model, which data, which permissions, who it reports to. Agents that can still be reached get a ready-to-paste message.</p></aside>
+<section id="org"></section><section id="runs" hidden></section><section id="time" hidden></section><section id="map" hidden></section>
+<section id="files" hidden></section><section id="cmd" hidden></section><section id="fin" hidden></section>
+<aside id="side"><h2>Select something</h2><p class="muted">Click an agent or a role card for its passport and its runs. Click any run for the full trail: task, model, files with hashes, commands and result.</p></aside>
 </main>
 <script>
-const D=__DATA__, P=D.passports, ids=Object.keys(P).sort();
+const D=__DATA__, P=D.persistent, R=D.runs, E=D.events;
 const esc=s=>String(s??'-').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmt=v=>{if(v==null||v===''||(Array.isArray(v)&&!v.length))return '-';if(Array.isArray(v))return v.map(fmt).join(', ');if(typeof v==='object')return Object.entries(v).filter(([k,x])=>x!=null&&x!=='').map(([k,x])=>k+': '+fmt(x)).join('; ');return String(v)};
-const isAgt=s=>typeof s==='string'&&/^AGT-\d{4,}$/.test(s)&&P[s];
-const invocable=p=>p.invocable&&!['suspended','killed'].includes(p.status)&&(p.status!=='ended'||(p.runtime&&p.runtime.agent_id));
-document.getElementById('sum').innerHTML=`${D.summary.agents} agents · <span class="${D.summary.errors?'err':''}">${D.summary.errors} errors</span> · ${D.summary.warnings} warnings · generated ${esc(D.generated_at.replace('T',' '))}`;
-document.getElementById('legend').innerHTML=['development','test','production','suspended','killed','ended','human'].map(s=>`<span><i style="background:var(--${s})"></i>${s}</span>`).join('');
-document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x===b));['org','act','files','cmd','fin'].forEach(t=>document.getElementById(t).hidden=t!==b.dataset.tab)});
-// build hierarchy
-const kids={},roots={};
-for(const id of ids){const p=P[id],up=p.reports_to;if(isAgt(up)&&up!==id)(kids[up]=kids[up]||[]).push(id);else{const h=(typeof up==='string'&&up&&!/TODO/.test(up))?up:(p.owner||'unassigned');(roots[h]=roots[h]||[]).push(id)}}
-function card(id){const p=P[id],off=!invocable(p);const rt=p.runtime||{};
-return `<button class="card${off?' off':''}" style="--c:var(--${p.status})" data-id="${id}"><b>${esc(p.name)}</b><small>${id} · ${esc(p.kind)}${p.role==='chief'?' · chief':''}</small><small>${esc((p.task&&p.task.purpose||'').slice(0,70))}</small><span class="pill">${esc(p.status)}${rt.resolved_model?' · '+esc(rt.resolved_model):''}</span></button>`}
-function node(id,depth){const ch=kids[id]||[];const persistent=ch.filter(c=>P[c].kind!=='ephemeral');const temp=ch.filter(c=>P[c].kind==='ephemeral');
-const groups={};temp.forEach(c=>{const k=(P[c].runtime&&P[c].runtime.agent_type)||P[c].name;(groups[k]=groups[k]||[]).push(c)});
-let inner=persistent.map(c=>node(c,depth+1)).join('');
-inner+=Object.entries(groups).map(([k,list])=>{const live=list.filter(c=>P[c].status==='production').length;
-return `<li><details class="group"${live?' open':''}><summary>${esc(k)} · ${list.length} run${list.length>1?'s':''}${live?` · <b>${live} running</b>`:''}</summary>${list.slice().reverse().map(card).join('')}</details></li>`}).join('');
-return `<li>${card(id)}${inner?`<ul>${inner}</ul>`:''}</li>`}
-document.getElementById('tree').innerHTML='<ul>'+Object.entries(roots).map(([h,list])=>`<li><div class="card human"><b>${esc(h)}</b><small>accountable human</small></div><ul>${list.map(id=>node(id,1)).join('')}</ul></li>`).join('')+'</ul>';
-// activity
-const A=D.activity.slice().reverse();
-document.getElementById('act').innerHTML=A.length?`<p class="muted">Subagent runs, newest first. This is what the chief reports when asked "who did what".</p><table><tr><th>Started</th><th>Agent</th><th>Task</th><th>Model</th><th>Time</th><th>Status</th><th>Result</th></tr>${A.map(r=>`<tr class="click" data-id="${r.agent_id}"><td>${esc((r.started||'').replace('T',' ').slice(0,16))}</td><td>${esc(r.agent_id)}<br><span class="muted">${esc(r.name)}</span></td><td>${esc(r.task)}</td><td>${esc(r.model)}</td><td>${r.duration_s!=null?r.duration_s+'s':'-'}</td><td>${esc(r.status)}</td><td>${esc((r.result||'').slice(0,200))}</td></tr>`).join('')}</table>`:'<p class="muted">No subagent runs recorded yet. Once auto-registration hooks are installed, every spawned subagent appears here.</p>';
-const F=Object.values(D.files||{}).sort((a,b)=>(b.touches.at(-1).ts||'').localeCompare(a.touches.at(-1).ts||''));
-const gnote=D.graphify?`Linked read-only to ${esc(D.graphify.path)} (built ${esc(D.graphify.built_at.replace('T',' '))}, ${D.graphify.files_in_graph} files in graph).`:'No graphify-out/graph.json found in this project; files are listed without graph context.';
-document.getElementById('files').innerHTML=`<p class="muted">Every file an agent changed, newest first. ${gnote} Click a row for the full trail.</p>`+(F.length?`<table><tr><th>File</th><th>Graphify cluster</th><th>Changes</th><th>Last change</th><th>Last by</th></tr>${F.map(f=>{const l=f.touches.at(-1),g=f.graphify||{};return `<tr class="click" data-file="${esc(f.file)}"><td>${esc(f.file)}</td><td>${esc(g.communities?g.communities.join(', '):(g.note?'not in graph':'-'))}</td><td>${f.touches.length}</td><td>${esc((l.ts||'').replace('T',' ').slice(0,16))}</td><td>${esc(l.actor)} ${esc(l.actor_name||'')}</td></tr>`}).join('')}</table>`:'<p class="muted">No file changes recorded yet.</p>');
-const C=(D.commands||[]).slice().reverse();
-document.getElementById('cmd').innerHTML=C.length?`<p class="muted">Shell commands run by agents (secrets redacted), newest first.</p><table><tr><th>When</th><th>Agent</th><th>Command</th><th>Failed</th></tr>${C.map(c=>`<tr class="click" data-id="${esc(c.actor)}"><td>${esc((c.ts||'').replace('T',' ').slice(0,16))}</td><td>${esc(c.actor)} ${esc(c.actor_name||'')}</td><td><code>${esc(c.command)}</code></td><td>${c.failed?'<span class="lvl-ERROR">yes</span>':(c.failed===false?'no':'-')}</td></tr>`).join('')}</table>`:'<p class="muted">No commands recorded yet.</p>';
-function selectFile(path){const f=(D.files||{})[path];if(!f)return;const g=f.graphify||{};
-document.getElementById('side').innerHTML=`<h2>${esc(path)}</h2><div class="muted">file trail</div><dl><dt>Graphify cluster</dt><dd>${esc(g.communities?g.communities.join(', '):(g.note||'-'))}</dd>${g.nodes?`<dt>Graph nodes in this file</dt><dd>${esc(g.nodes.join(', '))}</dd>`:''}${g.related_files&&g.related_files.length?`<dt>Connected files (graph)</dt><dd>${g.related_files.map(r=>(D.files||{})[r]?`<a href="#" data-file="${esc(r)}">${esc(r)}</a>`:esc(r)).join(', ')}</dd>`:''}<dt>Changes (newest first)</dt><dd><table>${f.touches.slice().reverse().map(t=>`<tr class="click" data-id="${esc(t.actor)}"><td>${esc((t.ts||'').replace('T',' ').slice(0,16))}</td><td>${esc(t.actor)} ${esc(t.actor_name||'')}<br><span class="muted">${esc(t.tool)} · sha ${esc((t.sha256||'-').slice(0,12))}</span></td></tr>`).join('')}</table></dd></dl><p class="muted" style="font-size:12px">CLI: python agent-passports/passport.py trace "${esc(path)}"</p>`}
-document.getElementById('fin').innerHTML=D.findings.length?`<table><tr><th>Level</th><th>Agent</th><th>Rule</th><th>Message</th></tr>${D.findings.map(f=>`<tr class="click" data-id="${f.agent_id}"><td class="lvl-${f.level}">${f.level}</td><td>${esc(f.agent_id)}</td><td>${esc(f.rule)}</td><td>${esc(f.message)}</td></tr>`).join('')}</table>`:'<p>No findings. All passports valid.</p>';
-// talk-to message
-function talk(id){const p=P[id],rt=p.runtime||{};if(!invocable(p))return {ok:false,why:p.status==='ended'?'This run has ended and cannot be resumed.':'Status is '+p.status+'; it cannot be invoked.'};
-if(p.role==='chief')return {ok:true,text:'(Talk to the chief directly in your agent session in this project.)\nReport who did what today: run python agent-passports/passport.py report --since today'};
-if(p.kind==='ephemeral'&&rt.agent_id)return {ok:true,text:`Continue subagent ${rt.agent_id} (passport ${id}, "${p.task&&p.task.purpose}") with SendMessage: `};
-if(p.platform==='claude-code')return {ok:true,text:`Use the ${p.name} subagent (passport ${id}) to: `};
-return {ok:true,text:`${p.how_to_invoke||'See passport'}\nTask for ${p.name} (${id}): `}}
-function select(id){const p=P[id];if(!p)return;document.querySelectorAll('.card.sel').forEach(c=>c.classList.remove('sel'));document.querySelectorAll(`.card[data-id="${id}"]`).forEach(c=>c.classList.add('sel'));
-const t=talk(id),fs=D.findings.filter(f=>f.agent_id===id),rt=p.runtime||{};
-const rows=[['Status',p.status+(invocable(p)?' · can be invoked':' · not invocable')],['Kind / platform',p.kind+' / '+p.platform+(p.auto_registered?' · auto-registered':'')],['Owner (human)',p.owner],['Reports to',p.reports_to],['Talks to',p.talks_to],['Instance of',p.instance_of],['Task',p.task&&p.task.purpose],['Human in the loop',p.task&&p.task.human_in_the_loop],['Model',p.model],['Data',p.data_dependencies],['Permissions',p.permissions],['Who may invoke',p.access&&p.access.who_can_invoke],['How to invoke',p.how_to_invoke],['Kill switch',p.risk&&p.risk.kill_switch],['Run',rt.started_at?{started:rt.started_at,ended:rt.ended_at,model:rt.resolved_model,tokens:rt.tokens,result:rt.result_summary}:null],['Created / updated',p.created_at+' / '+p.updated_at],['Review',p.review],['Last changes',(p.changelog||[]).slice(-4).map(c=>c.date+' '+c.change).join(' | ')],['Files changed',Object.values(D.files||{}).filter(f=>f.touches.some(t=>t.actor===id)).map(f=>f.file)]];
-document.getElementById('side').innerHTML=`<h2>${esc(p.name)}</h2><div class="muted">${id}</div>${fs.map(f=>`<p class="f lvl-${f.level}">${f.level}: ${esc(f.message)}</p>`).join('')}
-<div class="talk"><b>Talk to this agent</b>${t.ok?`<textarea id="msg">${esc(t.text)}</textarea><button class="btn" id="cp">Copy message</button> <span class="muted" id="cpok"></span><div class="muted" style="font-size:12px;margin-top:4px">Paste it in your agent session in this project and finish the sentence.</div>`:`<p class="muted">${esc(t.why)}</p>`}</div>
-<dl>${rows.filter(([k,v])=>v!=null&&v!==''&&!(Array.isArray(v)&&!v.length)).map(([k,v])=>`<dt>${k}</dt><dd>${esc(fmt(v))}</dd>`).join('')}</dl>`;
-const cp=document.getElementById('cp');if(cp)cp.onclick=async()=>{const ta=document.getElementById('msg');try{await navigator.clipboard.writeText(ta.value)}catch(e){ta.select();document.execCommand('copy')}document.getElementById('cpok').textContent='Copied'}}
-document.addEventListener('click',e=>{const fe=e.target.closest('[data-file]');if(fe){e.preventDefault();selectFile(fe.dataset.file);return}const el=e.target.closest('[data-id]');if(el&&(!e.target.closest('aside')||el.tagName==='TR'))select(el.dataset.id)});
-const chief=ids.find(i=>P[i].role==='chief');if(chief)select(chief);
-// Deep links: registry.html#files, #act, #cmd, #fin, or #AGT-0003 / #file=src/x.py
-(function(){const h=decodeURIComponent(location.hash.slice(1));if(!h)return;const tab=document.querySelector(`nav button[data-tab="${h}"]`);if(tab){tab.click();return}
-if(h.startsWith('file=')){document.querySelector('nav button[data-tab="files"]').click();selectFile(h.slice(5));return}if(P[h]){document.querySelectorAll('details.group').forEach(d=>d.open=true);select(h)}})();
+const ts=s=>s?new Date(s).getTime():NaN, hm=s=>s?String(s).replace('T',' ').slice(0,16):'-';
+const dur=ms=>ms==null?'-':ms<60000?Math.round(ms/1000)+'s':Math.round(ms/60000)+'m';
+const num=n=>n==null?'-':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n);
+const byId=Object.fromEntries(R.map(r=>[r.id,r]));
+const nameOf=id=>P[id]?P[id].name:(byId[id]?byId[id].role:id);
+const roleOfActor=id=>byId[id]?byId[id].role:(P[id]?(P[id].role==='chief'?'chief':P[id].name):String(id||'').startsWith('unresolved:')?'unlinked subagent':String(id||'unknown'));
+const PALETTE=['#4e79a7','#f28e2b','#59a14f','#b07aa1','#76b7b2','#edc948','#9c755f','#e15759','#ff9da7','#86bcb6'],roleCols={};
+const roleColor=r=>roleCols[r]||(roleCols[r]=PALETTE[Object.keys(roleCols).length%PALETTE.length]);
+const statusCol=s=>`var(--${s||'ended'})`;
+const runEnd=r=>{const e=ts(r.end);if(!isNaN(e))return e;const s=ts(r.start);return isNaN(s)?NaN:s+(r.ms||60000)};
+// ---------- period
+let since=0;
+function setPeriod(v){const now=Date.now();if(v==='all')since=0;else if(v==='q'){const d=new Date();since=new Date(d.getFullYear(),Math.floor(d.getMonth()/3)*3,1).getTime()}else since=now-(+v)*864e5;render()}
+const inP=t=>since===0||ts(t)>=since;
+document.getElementById('period').onchange=e=>setPeriod(e.target.value);
+// ---------- tabs
+const tabs=[...document.querySelectorAll('nav button')];
+function show(tab){tabs.forEach(b=>b.classList.toggle('on',b.dataset.tab===tab));document.querySelectorAll('main>section').forEach(s=>s.hidden=s.id!==tab)}
+tabs.forEach(b=>b.onclick=()=>show(b.dataset.tab));
+// ---------- organogram: structure only, runs folded into role cards
+function rolesUnder(parent,runs){const g={};runs.filter(r=>r.parent===parent).forEach(r=>{(g[r.role]=g[r.role]||[]).push(r)});return g}
+function roleStats(list){const s={n:list.length,run:0,bad:0,tok:0,last:0};list.forEach(r=>{if(r.status==='production')s.run++;if(r.status==='killed')s.bad++;s.tok+=r.tok||0;s.last=Math.max(s.last,ts(r.start)||0)});return s}
+function agentCard(id,pr){const p=P[id],n=R.filter(r=>r.inst===id&&inP(r.start)).length;
+return `<button class="card" style="--c:var(--${p.status})" data-agent="${id}"><b>${esc(p.name)}</b><small>${id} · ${esc(p.kind)}${p.role==='chief'?' · chief':''}</small><small>${esc((p.task&&p.task.purpose||'').slice(0,64))}</small><div class="stats"><span class="pill" style="--c:var(--${p.status})">${esc(p.status)}</span>${n?`<span class="st">${n} runs</span>`:''}</div></button>`}
+function roleCard(parent,role,list){const s=roleStats(list.filter(r=>inP(r.start))),all=list.length;
+return `<button class="card role${s.n?'':' idle'}" data-role="${esc(role)}" data-parent="${esc(parent)}"><b>${esc(role)}</b><small>subagent role · ${all} run${all>1?'s':''} in total</small><div class="stats"><span class="st">${s.n} in period</span>${s.run?`<span class="st run">${s.run} running</span>`:''}${s.bad?`<span class="st bad">${s.bad} stopped</span>`:''}${s.tok?`<span class="st">${num(s.tok)} tok</span>`:''}</div>${s.last?`<small>last ${hm(new Date(s.last).toISOString())}</small>`:''}</button>`}
+function nodeHtml(id){const kids=Object.keys(P).filter(k=>P[k].reports_to===id&&k!==id);const roles=rolesUnder(id,R);
+const rl=Object.entries(roles).sort((a,b)=>b[1].length-a[1].length);
+// all subagent roles of one agent sit in one wrapping grid, so ten or twenty roles stay readable
+const inner=kids.map(nodeHtml).join('')+(rl.length?`<li><div class="roles" style="--cols:${Math.min(3,rl.length)}"><div class="roles-hd">${rl.length} subagent role${rl.length>1?'s':''} · ${rl.reduce((t,[,l])=>t+l.length,0)} runs in total</div>${rl.map(([role,list])=>roleCard(id,role,list)).join('')}</div></li>`:'');
+return `<li>${agentCard(id)}${inner?`<ul>${inner}</ul>`:''}</li>`}
+function renderOrg(){const roots={};Object.keys(P).sort().forEach(id=>{const up=P[id].reports_to;if(!(typeof up==='string'&&P[up]))(roots[up||P[id].owner||'unassigned']=roots[up||P[id].owner||'unassigned']||[]).push(id)});
+document.getElementById('org').innerHTML=`<div class="legend">${['development','test','production','suspended','killed','ended','human'].map(s=>`<span><i style="background:var(--${s})"></i>${s}</span>`).join('')}<span>· dashed cards = subagent roles (runs folded together)</span></div><div class="tree"><ul>${Object.entries(roots).map(([h,ids])=>`<li><div class="card human"><b>${esc(h)}</b><small>accountable human</small></div><ul>${ids.map(nodeHtml).join('')}</ul></li>`).join('')}</ul></div>`}
+// ---------- runs table
+const RS={q:'',role:'',status:'',session:'',sort:'start',asc:false,limit:100};
+function filteredRuns(){const q=RS.q.toLowerCase();return R.filter(r=>inP(r.start)&&(!RS.role||r.role===RS.role)&&(!RS.status||r.status===RS.status)&&(!RS.session||r.session===RS.session)&&(!q||[r.id,r.task,r.role,r.result,r.model].join(' ').toLowerCase().includes(q)))}
+const filesBy={},cmdsBy={};E.forEach(e=>{(e.k==='f'?filesBy:cmdsBy)[e.a]=((e.k==='f'?filesBy:cmdsBy)[e.a]||[]).concat([e])});
+function renderRuns(){const rows=filteredRuns(),k=RS.sort;rows.sort((a,b)=>{let x=a[k],y=b[k];if(k==='files'){x=(filesBy[a.id]||[]).length;y=(filesBy[b.id]||[]).length}if(k==='start'){x=ts(x);y=ts(y)}return (x>y?1:x<y?-1:0)*(RS.asc?1:-1)});
+const roles=[...new Set(R.map(r=>r.role))].sort(),sess=[...new Set(R.filter(r=>inP(r.start)).map(r=>r.session))].filter(Boolean).sort().reverse();
+const opt=(v,l,cur)=>`<option value="${esc(v)}"${v===cur?' selected':''}>${esc(l)}</option>`;
+const col=(k,l,c='')=>`<th data-k="${k}" class="${c} ${RS.sort===k?'sorted'+(RS.asc?' asc':''):''}">${l}</th>`;
+document.getElementById('runs').innerHTML=`<div class="bar"><input id="rq" placeholder="Search task, result, model…" value="${esc(RS.q)}" style="min-width:240px">
+<select id="rrole">${opt('','All roles',RS.role)}${roles.map(r=>opt(r,r,RS.role)).join('')}</select>
+<select id="rstat">${opt('','All statuses',RS.status)}${['production','ended','killed'].map(s=>opt(s,s==='production'?'running':s,RS.status)).join('')}</select>
+<select id="rsess">${opt('','All sessions',RS.session)}${sess.map(s=>opt(s,s,RS.session)).join('')}</select>
+<span class="muted">${rows.length} runs</span><button class="btn" id="csv">Export CSV</button></div>
+<table><tr>${col('start','Started')}${col('id','Run')}${col('role','Role')}<th>Task</th>${col('session','Session')}${col('ms','Time','num')}${col('tok','Tokens','num')}${col('model','Model')}${col('files','Files','num')}${col('status','Status')}</tr>
+${rows.slice(0,RS.limit).map(r=>`<tr class="click" data-run="${r.id}"><td>${hm(r.start)}</td><td>${r.id}</td><td>${esc(r.role)}</td><td>${esc((r.task||'').slice(0,90))}</td><td><code>${esc(r.session)}</code></td><td class="num">${dur(r.ms)}</td><td class="num">${num(r.tok)}</td><td>${esc(r.model)}</td><td class="num">${(filesBy[r.id]||[]).length||''}</td><td><span class="pill" style="--c:${statusCol(r.status)}">${r.status==='production'?'running':esc(r.status)}</span></td></tr>`).join('')}</table>
+${rows.length>RS.limit?`<p><button class="btn" id="more">Show ${Math.min(100,rows.length-RS.limit)} more</button></p>`:''}`;
+const $=id=>document.getElementById(id);
+$('rq').oninput=e=>{RS.q=e.target.value;RS.limit=100;renderRuns();const i=$('rq');i.focus();i.setSelectionRange(i.value.length,i.value.length)};
+$('rrole').onchange=e=>{RS.role=e.target.value;renderRuns()};$('rstat').onchange=e=>{RS.status=e.target.value;renderRuns()};$('rsess').onchange=e=>{RS.session=e.target.value;renderRuns()};
+if($('more'))$('more').onclick=()=>{RS.limit+=100;renderRuns()};
+document.querySelectorAll('#runs th[data-k]').forEach(th=>th.onclick=()=>{RS.asc=RS.sort===th.dataset.k?!RS.asc:false;RS.sort=th.dataset.k;renderRuns()});
+$('csv').onclick=()=>{const head=['run','role','task','session','started','ended','duration_s','tokens','model','files_changed','commands','status','result'];
+const q=v=>'"'+String(v??'').replace(/"/g,'""')+'"';const lines=[head.join(',')].concat(rows.map(r=>[r.id,r.role,r.task,r.session,r.start,r.end,r.ms!=null?Math.round(r.ms/1000):'',r.tok,r.model,(filesBy[r.id]||[]).map(e=>e.p).join(' | '),(cmdsBy[r.id]||[]).length,r.status,r.result].map(q).join(',')));
+const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([lines.join('\n')],{type:'text/csv'}));a.download=`agent-runs-${D.project}.csv`;a.click()}}
+// ---------- timeline per session
+let tlLimit=8;
+function renderTimeline(){const ss={};R.filter(r=>inP(r.start)&&r.session).forEach(r=>(ss[r.session]=ss[r.session]||[]).push(r));
+const list=Object.entries(ss).map(([s,rs])=>{const a=Math.min(...rs.map(r=>ts(r.start))),b=Math.max(...rs.map(runEnd));return {s,rs,a,b}}).sort((x,y)=>y.a-x.a);
+document.getElementById('time').innerHTML=list.length?`<p class="muted">Each block is one work session. Bars are subagent runs on a shared time axis, one lane per role; runs that overlapped are stacked. Colour = role · <span style="outline:2px solid var(--killed);padding:0 4px;border-radius:3px">red outline</span> = stopped · <span style="outline:2px solid var(--production);padding:0 4px;border-radius:3px">green outline</span> = still running. Click a bar for the run.</p>`+list.slice(0,tlLimit).map(({s,rs,a,b})=>{
+ const span=Math.max(b-a,60000),lanes={};rs.forEach(r=>(lanes[r.role]=lanes[r.role]||[]).push(r));
+ const pts=[];rs.forEach(r=>{pts.push([ts(r.start),1]);pts.push([runEnd(r),-1])});pts.sort((x,y)=>x[0]-y[0]||x[1]-y[1]);let c=0,peak=0;pts.forEach(p=>{c+=p[1];peak=Math.max(peak,c)});
+ const tok=rs.reduce((t,r)=>t+(r.tok||0),0);
+ return `<div class="sess"><div class="hd"><b>Session ${esc(s)}</b><span>${hm(new Date(a).toISOString())} – ${hm(new Date(b).toISOString()).slice(11)}</span><span>${rs.length} runs</span><span>max ${peak} in parallel</span><span>${num(tok)} tokens</span><span>${Object.keys(lanes).length} roles</span></div><div class="lanes">
+ ${Object.entries(lanes).sort((x,y)=>y[1].length-x[1].length).map(([role,l])=>{
+   // pack overlapping runs of the same role into sub-rows so parallel work stays visible
+   const rowsEnd=[];const placed=l.slice().sort((p,q)=>ts(p.start)-ts(q.start)).map(r=>{let i=rowsEnd.findIndex(e=>e<=ts(r.start));if(i<0){i=rowsEnd.length;rowsEnd.push(0)}rowsEnd[i]=runEnd(r);return [r,i]});
+   const h=Math.max(1,rowsEnd.length)*12+4;
+   return `<div class="lane"><div class="nm" title="${esc(role)}">${esc(role)} · ${l.length}</div><div class="track" style="height:${h}px">${placed.map(([r,i])=>{const x=(ts(r.start)-a)/span*100,w=Math.max((runEnd(r)-ts(r.start))/span*100,.4);
+   return `<div class="blk${r.status==='killed'?' bad':r.status==='production'?' live':''}" data-run="${r.id}" style="left:${x}%;width:${w}%;top:${2+i*12}px;--c:${roleColor(role)}" title="${r.id} · ${esc(r.task)} · ${dur(r.ms)}${r.status==='killed'?' · stopped':''}"></div>`}).join('')}</div></div>`}).join('')}
+ <div class="axis"><div></div><div><span>${hm(new Date(a).toISOString()).slice(11)}</span><span>${dur(span)} total</span><span>${hm(new Date(a+span).toISOString()).slice(11)}</span></div></div></div></div>`}).join('')+(list.length>tlLimit?`<button class="btn" id="tlmore">Show more sessions (${list.length-tlLimit})</button>`:''):'<p class="muted">No sessions with subagent runs in this period.</p>';
+ const m=document.getElementById('tlmore');if(m)m.onclick=()=>{tlLimit+=8;renderTimeline()}}
+// ---------- where agents work: cluster x role
+function clusterOf(path){const g=D.graph[path];if(g&&g.c.length)return g.c[0];const parts=String(path).split('/');return parts.length>1?parts[0]+'/':'(project root)'}
+function renderMap(){const cells={},rows={},cols={};E.filter(e=>e.k==='f'&&inP(e.t)).forEach(e=>{const cl=clusterOf(e.p),ro=roleOfActor(e.a);const k=cl+'\u0000'+ro;(cells[k]=cells[k]||[]).push(e);rows[cl]=(rows[cl]||0)+1;cols[ro]=(cols[ro]||0)+1});
+const rk=Object.keys(rows).sort((a,b)=>rows[b]-rows[a]),ck=Object.keys(cols).sort((a,b)=>cols[b]-cols[a]);const mx=Math.max(1,...Object.values(cells).map(c=>c.length));
+const src=D.graphify?`Rows are graphify clusters (read-only from ${esc(D.graphify.path)}, built ${hm(D.graphify.built_at)}); files outside the graph are grouped by folder.`:'No graphify graph in this project, so rows are top-level folders. Add graphify for clusters by meaning.';
+document.getElementById('map').innerHTML=rk.length?`<p class="muted">Which parts of the project each agent role changed in this period. ${src} Click a cell for the files.</p><table class="heat"><tr><th>Cluster / area</th>${ck.map(c=>`<th class="col">${esc(c)}</th>`).join('')}<th>Total</th></tr>
+${rk.map(r=>`<tr><td>${esc(r)}</td>${ck.map(c=>{const l=cells[r+'\u0000'+c]||[];const a=l.length/mx;return `<td class="cell" ${l.length?`data-cell="${esc(r)}\u0000${esc(c)}"`:''} style="background:rgba(var(--heat),${l.length?.12+a*.6:0})">${l.length||''}</td>`}).join('')}<td class="num"><b>${rows[r]}</b></td></tr>`).join('')}</table>`:'<p class="muted">No file changes in this period.</p>';
+document.querySelectorAll('#map [data-cell]').forEach(td=>td.onclick=()=>{const [r,c]=td.dataset.cell.split('\u0000');const l=cells[r+'\u0000'+c]||[];
+side(`<h2>${esc(r)}</h2><div class="muted">changed by ${esc(c)} · ${l.length} change${l.length>1?'s':''}</div><div class="list">${l.slice().reverse().map(e=>`<div>${hm(e.t)} · <span class="link" data-file="${esc(e.p)}">${esc(e.p)}</span> · <span class="link" data-runlink="${esc(e.a)}">${esc(e.a)}</span></div>`).join('')}</div>`)})}
+// ---------- files, commands, findings
+function renderFiles(){const f={};E.filter(e=>e.k==='f'&&inP(e.t)).forEach(e=>(f[e.p]=f[e.p]||[]).push(e));const l=Object.entries(f).sort((a,b)=>ts(b[1].at(-1).t)-ts(a[1].at(-1).t));
+document.getElementById('files').innerHTML=l.length?`<p class="muted">Every file an agent changed in this period, newest first. Click a row for its trail.</p><table><tr><th>File</th><th>Cluster / area</th><th>Changes</th><th>Last change</th><th>Last by</th></tr>${l.map(([p,es])=>{const x=es.at(-1);return `<tr class="click" data-file="${esc(p)}"><td>${esc(p)}${es.some(e=>e.flag)?' ⚠':''}</td><td>${esc(clusterOf(p))}</td><td class="num">${es.length}</td><td>${hm(x.t)}</td><td>${esc(x.a)} ${esc(nameOf(x.a))}</td></tr>`}).join('')}</table>`:'<p class="muted">No file changes in this period.</p>'}
+function renderCmds(){const c=E.filter(e=>e.k==='c'&&inP(e.t)).slice(-500).reverse();
+document.getElementById('cmd').innerHTML=c.length?`<p class="muted">Shell commands and external (MCP) actions by agents, secrets redacted, newest first${c.length===500?' (latest 500)':''}.</p><table><tr><th>When</th><th>Agent</th><th>Command / action</th><th>Failed</th></tr>${c.map(e=>`<tr class="click" data-runlink="${esc(e.a)}"><td>${hm(e.t)}</td><td>${esc(e.a)} ${esc(nameOf(e.a))}</td><td><code>${esc(e.p)}</code></td><td>${e.fail?'<span class="lvl-ERROR">yes</span>':e.fail===false?'no':'-'}</td></tr>`).join('')}</table>`:'<p class="muted">No commands in this period.</p>'}
+function renderFindings(){document.getElementById('fin').innerHTML=D.findings.length?`<table><tr><th>Level</th><th>Agent</th><th>Rule</th><th>Message</th></tr>${D.findings.map(f=>`<tr class="click" data-runlink="${esc(f.agent_id)}"><td class="lvl-${f.level}">${f.level}</td><td>${esc(f.agent_id)}</td><td>${esc(f.rule)}</td><td>${esc(f.message)}</td></tr>`).join('')}</table>`:'<p>No findings. All passports valid.</p>'}
+// ---------- side panel
+function side(h){document.getElementById('side').innerHTML=h}
+function dl(rows){return `<dl>${rows.filter(([k,v])=>v!=null&&v!==''&&!(Array.isArray(v)&&!v.length)).map(([k,v])=>`<dt>${k}</dt><dd>${typeof v==='string'&&v.startsWith('<')?v:esc(fmt(v))}</dd>`).join('')}</dl>`}
+function talkBox(text,why){return `<div class="talk"><b>Talk to this agent</b>${text?`<textarea id="msg">${esc(text)}</textarea><button class="btn pri" id="cp">Copy message</button> <span class="muted" id="cpok"></span>`:`<p class="muted">${esc(why)}</p>`}</div>`}
+function bindCopy(){const cp=document.getElementById('cp');if(cp)cp.onclick=async()=>{const t=document.getElementById('msg');try{await navigator.clipboard.writeText(t.value)}catch(e){t.select();document.execCommand('copy')}document.getElementById('cpok').textContent='Copied'}}
+function showRun(id){const r=byId[id];if(!r)return showAgent(id);const fs=filesBy[id]||[],cs=cmdsBy[id]||[];
+document.querySelectorAll('.blk.sel').forEach(b=>b.classList.remove('sel'));document.querySelectorAll(`.blk[data-run="${id}"]`).forEach(b=>b.classList.add('sel'));
+side(`<h2>${esc(r.id)} · ${esc(r.role)}</h2><div><span class="pill" style="--c:${statusCol(r.status)}">${r.status==='production'?'running':esc(r.status)}</span> <span class="muted">session ${esc(r.session)}${r.auto?' · auto-registered':''}</span></div>
+${r.inv&&r.agent?talkBox(`Continue subagent ${r.agent} (passport ${r.id}, "${r.task}") with SendMessage: `):''}
+${dl([['Task',r.task],['Prompt (excerpt)',r.prompt],['Instance of',r.inst?`<span class="link" data-agentlink="${esc(r.inst)}">${esc(r.inst)} ${esc(nameOf(r.inst))}</span>`:null],['Reports to',r.parent?`<span class="link" data-agentlink="${esc(r.parent)}">${esc(r.parent)} ${esc(nameOf(r.parent))}</span>`:null],['Owner (human)',r.owner],['Model',r.model],['Started / ended',hm(r.start)+' → '+hm(r.end)],['Duration · tokens',dur(r.ms)+' · '+num(r.tok)],['Tools',r.tools],['Data',r.data],['Result',r.result],['Transcript',r.transcript]])}
+<h3>Files changed (${fs.length})</h3><div class="list">${fs.map(e=>`<div><span class="link" data-file="${esc(e.p)}">${esc(e.p)}</span>${e.flag?' ⚠ '+esc(e.flag):''}<br><span class="muted">${hm(e.t)} · ${esc(e.tool)} · sha ${esc(e.sha)} · ${esc(clusterOf(e.p))}</span></div>`).join('')||'<div class="muted">none</div>'}</div>
+<h3>Commands & actions (${cs.length})</h3><div class="list">${cs.map(e=>`<div><code>${esc(e.p)}</code><br><span class="muted">${hm(e.t)} · ${esc(e.tool)}${e.fail?' · failed':''}</span></div>`).join('')||'<div class="muted">none</div>'}</div>
+<p class="muted" style="font-size:12px">CLI: python agent-passports/passport.py report --session ${esc(r.session)}</p>`);bindCopy()}
+function talkFor(p,id){if(!p.invocable||['suspended','killed','ended'].includes(p.status))return [null,'Status is '+p.status+'; it cannot be invoked.'];
+if(p.role==='chief')return ['Report who did what today: python agent-passports/passport.py report --since today --summary'];
+if(p.platform==='claude-code')return [`Use the ${p.name} subagent (passport ${id}) to: `];return [`${p.how_to_invoke||'See passport'}\nTask for ${p.name} (${id}): `]}
+function showAgent(id){const p=P[id];if(!p){if(byId[id])return showRun(id);return}document.querySelectorAll('.card.sel').forEach(c=>c.classList.remove('sel'));document.querySelectorAll(`.card[data-agent="${id}"]`).forEach(c=>c.classList.add('sel'));
+const inst=R.filter(r=>r.inst===id&&inP(r.start)),fin=D.findings.filter(f=>f.agent_id===id),[t,why]=talkFor(p,id);
+side(`<h2>${esc(p.name)}</h2><div class="muted">${id} · ${esc(p.kind)}${p.role==='chief'?' · chief':''}${p.auto_registered?' · auto-registered':''}</div>${fin.map(f=>`<p class="lvl-${f.level}" style="font-size:12.5px;margin:6px 0">${f.level}: ${esc(f.message)}</p>`).join('')}
+${talkBox(t,why)}${inst.length?`<p><span class="link" data-rolelink="${esc(p.name)}">${inst.length} runs of this agent in the period →</span></p>`:''}
+${dl([['Status',p.status],['Owner (human)',p.owner],['Reports to',p.reports_to],['Talks to',p.talks_to],['Task',p.task&&p.task.purpose],['Human in the loop',p.task&&p.task.human_in_the_loop],['Model',p.model],['Data',p.data_dependencies],['Permissions',p.permissions],['Who may invoke',p.access&&p.access.who_can_invoke],['How to invoke',p.how_to_invoke],['Kill switch',p.risk&&p.risk.kill_switch],['Review',p.review],['Created / updated',p.created_at+' / '+p.updated_at],['Last changes',(p.changelog||[]).slice(-4).map(c=>c.date+' '+c.change).join(' | ')]])}`);bindCopy()}
+function showRole(role,parent){const list=R.filter(r=>r.role===role&&(!parent||r.parent===parent)),inp=list.filter(r=>inP(r.start)).sort((a,b)=>ts(b.start)-ts(a.start)),s=roleStats(inp);
+const models=[...new Set(inp.map(r=>r.model).filter(Boolean))],avg=inp.filter(r=>r.ms).reduce((t,r)=>t+r.ms,0)/(inp.filter(r=>r.ms).length||1);const inst=list.find(r=>r.inst);
+side(`<h2>${esc(role)}</h2><div class="muted">subagent role · reports to ${esc(parent||'-')} ${esc(nameOf(parent))}</div>
+${dl([['In period',`${s.n} runs · ${s.run} running · ${s.bad} stopped`],['All time',list.length+' runs'],['Average duration',inp.length?dur(avg):'-'],['Tokens in period',num(s.tok)],['Models used',models],['Instance of',inst?`<span class="link" data-agentlink="${esc(inst.inst)}">${esc(inst.inst)} ${esc(nameOf(inst.inst))}</span>`:'no persistent passport (ad-hoc type)'],['Tools',inp[0]&&inp[0].tools]])}
+<h3>Latest runs</h3><div class="list">${inp.slice(0,30).map(r=>`<div class="link" data-runlink="${r.id}">${hm(r.start)} · ${r.id} · ${esc((r.task||'').slice(0,70))} <span class="muted">· ${r.status==='production'?'running':esc(r.status)}</span></div>`).join('')||'<div class="muted">No runs in this period.</div>'}</div>
+${inp.length>30?`<p><button class="btn" data-rolelink="${esc(role)}">All ${inp.length} in the Runs table →</button></p>`:''}`)}
+function showFile(path){const es=E.filter(e=>e.k==='f'&&e.p===path),g=D.graph[path];
+side(`<h2>${esc(path)}</h2><div class="muted">file trail</div>${dl([['Cluster / area',clusterOf(path)],['Graph nodes',g&&g.n],['Connected files (graph)',g&&g.r.length?g.r.map(x=>`<span class="link" data-file="${esc(x)}">${esc(x)}</span>`).join(', '):null]])}
+<h3>Changes (${es.length})</h3><div class="list">${es.slice().reverse().map(e=>`<div><span class="link" data-runlink="${esc(e.a)}">${esc(e.a)} ${esc(nameOf(e.a))}</span>${e.flag?' ⚠ '+esc(e.flag):''}<br><span class="muted">${hm(e.t)} · ${esc(e.tool)} · sha ${esc(e.sha)}</span></div>`).join('')}</div>
+<p class="muted" style="font-size:12px">CLI: python agent-passports/passport.py trace "${esc(path)}"</p>`)}
+document.addEventListener('click',e=>{const t=e.target.closest('[data-run],[data-runlink],[data-agent],[data-agentlink],[data-role],[data-rolelink],[data-file]');if(!t)return;
+if(t.dataset.file!=null){e.preventDefault();return showFile(t.dataset.file)}
+if(t.dataset.rolelink!=null){RS.role=t.dataset.rolelink;RS.limit=100;renderRuns();show('runs');return}
+if(t.dataset.role!=null){document.querySelectorAll('.card.sel').forEach(c=>c.classList.remove('sel'));t.classList.add('sel');return showRole(t.dataset.role,t.dataset.parent)}
+const id=t.dataset.run||t.dataset.runlink||t.dataset.agent||t.dataset.agentlink;if(byId[id])showRun(id);else showAgent(id)});
+// ---------- header + render all
+function render(){const inp=R.filter(r=>inP(r.start)),roles=new Set(inp.map(r=>r.role)),tok=inp.reduce((t,r)=>t+(r.tok||0),0),files=new Set(E.filter(e=>e.k==='f'&&inP(e.t)).map(e=>e.p));
+document.getElementById('sub').textContent=`${D.project} · generated ${hm(D.generated_at)} · ${D.summary.errors} errors · ${D.summary.warnings} warnings`;
+document.getElementById('kpis').innerHTML=[[Object.keys(P).length,'agents'],[roles.size,'active roles'],[inp.length,'runs'],[inp.filter(r=>r.status==='production').length,'running'],[num(tok),'tokens'],[files.size,'files changed']].map(([n,l])=>`<span class="kpi"><b>${n}</b>${l}</span>`).join('');
+renderOrg();renderRuns();renderTimeline();renderMap();renderFiles();renderCmds();renderFindings()}
+setPeriod('7');
+const chief=Object.keys(P).find(i=>P[i].role==='chief');if(chief)showAgent(chief);
+// deep links: #runs #time #map #files #cmd #fin #org, #AGT-0004, #role=name, #file=path, #all (period)
+function route(){const h=decodeURIComponent(location.hash.slice(1));if(!h)return;if(h==='all'){document.getElementById('period').value='all';return setPeriod('all')}
+const tab=tabs.find(b=>b.dataset.tab===h);if(tab)return show(h);
+if(h.startsWith('file=')){show('files');return showFile(h.slice(5))}if(h.startsWith('role=')){return showRole(h.slice(5))}
+if(byId[h]){show('runs');return showRun(h)}if(P[h])showAgent(h)}
+window.addEventListener('hashchange',route);route();
 </script></body></html>
 """
+
 
 README = """# Agent passports
 
@@ -2069,6 +2277,7 @@ def main():
     p = sub.add_parser("report")
     p.add_argument("--since", help="YYYY-MM-DD or 'today'")
     p.add_argument("--session", help="session id (prefix is enough)")
+    p.add_argument("--summary", action="store_true", help="totals per role only (short, cheap to read)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_report)
 
