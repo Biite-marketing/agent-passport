@@ -7,6 +7,11 @@ hash-chained audit trail of which agent changed which file, ran which command or
 and renders it all as an organogram. Built for audits (ISO/IEC 42001, ISO/IEC 27001, NEN 7510, EU AI Act) and for
 multi-agent projects where agents need to know who they can talk to.
 
+> **Not a certified compliance tool.** Agent Passport is a governance aid for your AI agent harness. It is not
+> endorsed, certified or designated by ISO, NEN or any certification body, and using it does not make you
+> compliant with ISO/IEC 42001, ISO/IEC 27001, NEN 7510 or the EU AI Act. What it does is keep an organised record
+> of your agents and what they did, which you can use as supporting evidence in audits next to your own process.
+
 ## Install
 
 ```bash
@@ -55,6 +60,25 @@ register agents with two commands (`spawn` / `end`).
 - **Organogram:** `agent-passports/registry.html` shows humans, the chief (main session), agents and subagent
   runs. Click an agent for its passport and a ready-to-paste message to address it. There are tabs for
   *Who did what*, *Files*, *Commands* and *Findings*.
+
+## Screenshots
+
+Examples from a fictional demo project.
+
+**Organogram**: the accountable human, the chief (main session), persistent agents and every subagent run. Click
+an agent for its passport.
+
+![Organogram](docs/organogram.png)
+
+**Who did what**: every subagent run with task, model, duration and result.
+
+![Who did what](docs/who-did-what.png)
+
+**Files**: which agent changed which file, linked read-only to the graphify cluster it belongs to.
+
+![Files](docs/files.png)
+
+Deep links work too: `registry.html#files`, `#act`, `#AGT-0004` or `#file=src/scoring.py`.
 
 ## Quick start (in a project)
 

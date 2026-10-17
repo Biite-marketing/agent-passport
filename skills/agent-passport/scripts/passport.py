@@ -1404,7 +1404,8 @@ def report_rows(root, since=None, session=None):
     agents, _ = load_all(root)
     touched = {}
     for t in file_ledger_entries(root, agents):
-        touched.setdefault(t["actor"], []).append(t["file"])
+        if t["event"] == "file_change" and t["file"]:  # commands have no file
+            touched.setdefault(t["actor"], []).append(t["file"])
     rows = []
     for aid, p in sorted(agents.items()):
         if p.get("kind") != "ephemeral":
@@ -1953,6 +1954,9 @@ document.getElementById('side').innerHTML=`<h2>${esc(p.name)}</h2><div class="mu
 const cp=document.getElementById('cp');if(cp)cp.onclick=async()=>{const ta=document.getElementById('msg');try{await navigator.clipboard.writeText(ta.value)}catch(e){ta.select();document.execCommand('copy')}document.getElementById('cpok').textContent='Copied'}}
 document.addEventListener('click',e=>{const fe=e.target.closest('[data-file]');if(fe){e.preventDefault();selectFile(fe.dataset.file);return}const el=e.target.closest('[data-id]');if(el&&(!e.target.closest('aside')||el.tagName==='TR'))select(el.dataset.id)});
 const chief=ids.find(i=>P[i].role==='chief');if(chief)select(chief);
+// Deep links: registry.html#files, #act, #cmd, #fin, or #AGT-0003 / #file=src/x.py
+(function(){const h=decodeURIComponent(location.hash.slice(1));if(!h)return;const tab=document.querySelector(`nav button[data-tab="${h}"]`);if(tab){tab.click();return}
+if(h.startsWith('file=')){document.querySelector('nav button[data-tab="files"]').click();selectFile(h.slice(5));return}if(P[h]){document.querySelectorAll('details.group').forEach(d=>d.open=true);select(h)}})();
 </script></body></html>
 """
 

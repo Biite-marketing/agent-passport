@@ -115,6 +115,8 @@ To investigate:
 3. `report --session <id>` for the full context of that session.
 4. `verify` to check the trail. Each entry carries the hash of the previous one, so editing, deleting or reordering a line breaks the chain. Someone with write access could still rewrite the whole chain, unless an anchor stored outside the project exists. For audit use, set `PASSPORT_ANCHOR_FILE` (a share or synced folder the agent can't write to) or `PASSPORT_ANCHOR_URL` (a webhook or log collector). Then every session end sends the log's head out of reach. Direct edits to the log through the agent's tools are blocked by a hook.
 
+Be accurate about what this is: a governance aid for the agent harness, not certified or ISO/NEN-designated tooling. It helps prepare for audits; it never makes anyone compliant on its own.
+
 Treat `activity.jsonl` and `passports/` as evidence: never edit or delete them, and commit them to version control so history is preserved off-machine. `references/audit.md` has an incident playbook and how the trail maps to ISO/IEC 42001, ISO/IEC 27001, NEN 7510 and the EU AI Act.
 
 ### Graphify (read-only)

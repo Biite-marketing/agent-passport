@@ -1,5 +1,7 @@
 # Audit and incident investigation
 
+This skill is a governance aid, not certified or designated tooling: it is not endorsed by ISO, NEN or any certification body. When you talk to users or auditors, present the registry as supporting evidence that helps with audits, never as proof of compliance.
+
 ## Contents
 1. What is recorded, and what isn't
 2. Incident playbook
