@@ -10,11 +10,26 @@ multi-agent projects where agents need to know who they can talk to.
 ## Install
 
 ```bash
-npx skills add Dremeka-sudo/agent-passport
+npx skills add Biite-marketing/agent-passport -g
 ```
 
 Works with any agent that supports skills (Claude Code, Cursor, Codex, Gemini CLI, Copilot and more).
-Add `-g` to install it for all your projects, or `-a claude-code` to pick specific agents.
+`-g` installs it for all your projects; leave it out to install it in the current project only, or add
+`-a claude-code` to pick specific agents. While the repository is private, you need read access to it.
+
+### Monitor every project automatically (Claude Code)
+
+Installing the skill teaches your agents the rules. To have *every* project start its own register on its first
+agent activity, without setting anything up per project, install the hooks once at user level:
+
+```bash
+python ~/.claude/skills/agent-passport/scripts/passport.py install-hooks --global
+```
+
+Each project then gets its own `agent-passports/` folder the first time an agent works in it. Agent IDs
+(`AGT-0001`, ...) are per project. To skip a project, put an empty `.no-agent-passports` file in its root;
+`PASSPORT_DISABLE=1` pauses it everywhere; `install-hooks --global --remove` turns it off. Projects that have
+their own passport hooks keep using those, so nothing is logged twice.
 
 Requirements: Python 3.8+ (standard library only). Automatic registration uses Claude Code hooks; other platforms
 register agents with two commands (`spawn` / `end`).
@@ -47,7 +62,7 @@ Ask your agent to "set up agent passports for this project", or run it yourself:
 
 ```bash
 python <skill-dir>/scripts/passport.py init
-python agent-passports/passport.py install-hooks      # Claude Code: automatic registration + audit trail
+python agent-passports/passport.py install-hooks      # Claude Code, this project only (or use --global once, above)
 python agent-passports/passport.py scan               # existing agent definitions without a passport
 python agent-passports/passport.py build              # organogram: agent-passports/registry.html
 ```

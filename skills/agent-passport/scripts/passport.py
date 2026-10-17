@@ -1027,12 +1027,17 @@ def cmd_hook(args):
     """Never fails the agent because of a registry problem: errors go to hook-errors.log and are
     recorded in the trail as a gap. The only thing it ever blocks is a direct edit of the audit log."""
     root = root_dir(args)
+    if args.global_hook and not global_hook_applies(root):
+        sys.exit(0)
     try:
         raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")  # hook payloads are UTF-8
         payload = json.loads(raw) if raw.strip() else {}
         event = payload.get("hook_event_name")
         if not root.exists():
-            (root / "passports").mkdir(parents=True, exist_ok=True)
+            # First agent activity in this project: start its register automatically.
+            init_folder(root)
+            activity(root, "registry_initialised", by=HOOK_BY,
+                     note="created automatically on the first agent activity in this project")
         if event == "PreToolUse" and payload.get("tool_name") in FILE_TOOLS | COMMAND_TOOLS:
             reason = on_pre_tool(root, payload)
             if reason:
@@ -1073,29 +1078,92 @@ def cmd_hook(args):
     sys.exit(0)
 
 
-def cmd_install_hooks(args):
-    root = root_dir(args)
+GLOBAL_HOME = Path.home() / ".agent-passport"
+OPT_OUT_FILE = ".no-agent-passports"
+
+
+def has_project_hooks(proj):
+    for name in ("settings.json", "settings.local.json"):
+        f = proj / ".claude" / name
+        try:
+            if "passport.py" in f.read_text(encoding="utf-8") and "--global-hook" not in f.read_text(encoding="utf-8"):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def global_hook_applies(root):
+    """The user-level hook runs in every Claude Code session. It stays out of the way when it shouldn't act:
+    the home folder itself, projects that opted out, and projects that have their own passport hooks
+    (which would otherwise log everything twice)."""
     proj = project_root(root)
-    settings_path = proj / ".claude" / ("settings.local.json" if args.local else "settings.json")
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("PASSPORT_DISABLE"):
+        return False
+    try:
+        if not proj.is_dir() or proj.resolve() == Path.home().resolve():
+            return False
+    except OSError:
+        return False
+    if (proj / OPT_OUT_FILE).exists():
+        return False
+    return not has_project_hooks(proj)
+
+
+def write_hooks(settings_path, command):
     settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
-    python = args.python or ("python" if os.name == "nt" else "python3")
-    rel = root.relative_to(proj).as_posix()
-    command = f'{python} "$CLAUDE_PROJECT_DIR/{rel}/passport.py" --dir "$CLAUDE_PROJECT_DIR/{rel}" hook'
     wanted = {"PreToolUse": "|".join(sorted(TRACKED_TOOLS)),
               "PostToolUse": "|".join(sorted(TRACKED_TOOLS)) + "|mcp__.*",
               "SubagentStart": None, "SubagentStop": None, "SessionEnd": None}
     hooks = settings.setdefault("hooks", {})
     for event, matcher in wanted.items():
-        # Replace an older passport hook instead of adding a second one.
+        # Replace an older passport hook instead of adding a second one; other hooks are left alone.
         entries = [e for e in hooks.get(event, [])
                    if not any("passport.py" in h.get("command", "") for h in e.get("hooks", []))]
         hooks[event] = entries
+        if command is None:
+            if not entries:
+                hooks.pop(event)
+            continue
         entry = {"hooks": [{"type": "command", "command": command, "timeout": 30}]}
         if matcher:
             entry = {"matcher": matcher, **entry}
         entries.append(entry)
+    if not hooks:
+        settings.pop("hooks")
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+
+
+def cmd_install_hooks(args):
+    if args.global_:
+        # User level: every project gets its own agent-passports/ on its first agent activity.
+        GLOBAL_HOME.mkdir(parents=True, exist_ok=True)
+        script = GLOBAL_HOME / "passport.py"
+        shutil.copy2(Path(__file__).resolve(), script)
+        python = args.python or Path(sys.executable).as_posix()  # this machine's interpreter: no PATH guessing
+        command = (f'"{python}" "{script.as_posix()}" --dir "$CLAUDE_PROJECT_DIR/agent-passports" '
+                   f'hook --global-hook')
+        settings_path = Path.home() / ".claude" / "settings.json"
+        write_hooks(settings_path, None if args.remove else command)
+        if args.remove:
+            print(f"Global agent-passport hooks removed from {settings_path}")
+            return
+        print(f"Global hooks written to {settings_path} (script: {script})")
+        print("From the next Claude Code session on, every project gets agent-passports/ on its first agent")
+        print(f"activity. Opt a project out with an empty '{OPT_OUT_FILE}' file in its root; set PASSPORT_DISABLE=1")
+        print("to pause everywhere. Projects with their own passport hooks keep using those.")
+        return
+    root = root_dir(args)
+    proj = project_root(root)
+    settings_path = proj / ".claude" / ("settings.local.json" if args.local else "settings.json")
+    python = args.python or ("python" if os.name == "nt" else "python3")
+    rel = root.relative_to(proj).as_posix()
+    command = f'{python} "$CLAUDE_PROJECT_DIR/{rel}/passport.py" --dir "$CLAUDE_PROJECT_DIR/{rel}" hook'
+    write_hooks(settings_path, None if args.remove else command)
+    if args.remove:
+        print(f"Agent-passport hooks removed from {settings_path.relative_to(proj).as_posix()}")
+        return
     print(f"Auto-registration hooks written to {settings_path.relative_to(proj).as_posix()}")
     print("Every subagent spawned in this project now gets a passport automatically, and every file change")
     print("and command is attributed to the agent that made it (agent-passports/activity.jsonl).")
@@ -1103,8 +1171,7 @@ def cmd_install_hooks(args):
 
 # ---------------------------------------------------------------- manual commands
 
-def cmd_init(args):
-    root = root_dir(args)
+def init_folder(root):
     (root / "passports").mkdir(parents=True, exist_ok=True)
     here = Path(__file__).resolve()
     if here.parent != root:
@@ -1112,6 +1179,11 @@ def cmd_init(args):
     readme = root / "README.md"
     if not readme.exists():
         readme.write_text(README, encoding="utf-8")
+
+
+def cmd_init(args):
+    root = root_dir(args)
+    init_folder(root)
     print(f"Initialised {root}")
     print(f"Run from the project root: python {root.name}/passport.py validate")
 
@@ -1916,10 +1988,16 @@ def main():
 
     p = sub.add_parser("install-hooks")
     p.add_argument("--local", action="store_true", help="write .claude/settings.local.json instead (not shared)")
-    p.add_argument("--python", help="interpreter command used by the hook (default: python on Windows, python3 elsewhere)")
+    p.add_argument("--global", dest="global_", action="store_true",
+                   help="user level: every project gets agent-passports/ on its first agent activity")
+    p.add_argument("--remove", action="store_true", help="remove the agent-passport hooks again")
+    p.add_argument("--python", help="interpreter used by the hook (default: python/python3 per project, "
+                                    "this interpreter's full path for --global)")
     p.set_defaults(fn=cmd_install_hooks)
 
-    sub.add_parser("hook").set_defaults(fn=cmd_hook)
+    p = sub.add_parser("hook")
+    p.add_argument("--global-hook", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_hook)
 
     p = sub.add_parser("new")
     p.add_argument("--name", required=True)

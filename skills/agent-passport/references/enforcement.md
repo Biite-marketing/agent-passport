@@ -92,6 +92,19 @@ Persistent agents can also be gated in code: load `agent-passports/registry.json
 ```
 Only add this when the user wants it, because it stops the agent from finishing until errors are fixed.
 
+## Every project automatically: global hooks (Claude Code)
+
+```sh
+python <skill-dir>/scripts/passport.py install-hooks --global
+```
+This writes the same hooks to the user-level `~/.claude/settings.json`, pointing at a copy of the script in `~/.agent-passport/` and at this machine's Python interpreter. From the next session on, the first agent activity in any project creates that project's `agent-passports/` and starts the register. IDs are per project. It skips:
+- the home folder itself;
+- projects with an empty `.no-agent-passports` file in their root;
+- projects that have their own passport hooks in `.claude/settings*.json`, so nothing is logged twice;
+- every project, while `PASSPORT_DISABLE=1` is set.
+
+Remove it with `install-hooks --global --remove`. Other hooks in the settings file are left untouched.
+
 ## Organisation-wide: install globally
 
 If an organisation wants every project to work this way, install the skill at user or org level (for Claude Code `~/.claude/skills/agent-passport/`; for other agents, their global skills or rules folder). Add the Layer 1 snippet to the global instruction file (for example `~/.claude/CLAUDE.md` or the org's shared `AGENTS.md` template) with one extra line: "If the project has no `agent-passports/` folder yet, initialise it before creating the first agent."
