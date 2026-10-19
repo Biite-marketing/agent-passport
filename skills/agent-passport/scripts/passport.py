@@ -19,7 +19,7 @@ Commands
   trace QUERY                  audit: who changed this file / folder / graphify cluster, when, with which hash
   verify                       prove the audit log was not altered (hash chain)
   build                        write registry.json, REGISTRY.md and registry.html (the organogram)
-  directory [--json]           who can be invoked right now, and how
+  directory [--json] [--all]   who can be invoked right now, and how (finished runs only with --all)
 
 Global option --dir points at the agent-passports folder (default: ./agent-passports).
 Set PASSPORT_TODAY=YYYY-MM-DD to fake today's date (useful for tests).
@@ -669,17 +669,27 @@ def validate(root):
             findings.append(finding("WARNING", e.get("actor") or str(e.get("subagent_id")), "audit-trail",
                                     f"{e.get('file')} was edited directly at {e.get('ts')}; run verify"))
     # Who read sensitive paths without the passport saying they may.
+    # Grouped per role and pattern, so 500 runs of one agent type give one finding that names the runs.
     flagged = {}
     for r in read_ledger(root, agents)[0]:
         if r["sens"]:
             flagged.setdefault((r["actor"], r["pattern"]), []).append(r["path"])
+    grouped = {}
     for (actor, pat), paths in flagged.items():
-        uncovered = sorted({x for x in paths if not declares_access(agents.get(actor), agents, x)})
+        uncovered = {x for x in paths if not declares_access(agents.get(actor), agents, x)}
         if uncovered:
-            findings.append(finding("WARNING", actor, "data-access",
-                                    f"read {len(uncovered)} sensitive path(s) matching '{pat}' (e.g. {uncovered[0]}) that its "
-                                    "passport does not cover: add them to permissions.file_access or data_dependencies, "
-                                    "or find out why they were read"))
+            p = agents.get(actor)
+            role = role_of(p, agents) if p else actor
+            g = grouped.setdefault((role, pat), {"actors": [], "paths": set()})
+            g["actors"].append(actor)
+            g["paths"] |= uncovered
+    for (role, pat), g in grouped.items():
+        actors, paths = sorted(g["actors"]), sorted(g["paths"])
+        who = actors[0] if len(actors) == 1 else f"{len(actors)} runs of '{role}' ({', '.join(actors[:3])}{', ...' if len(actors) > 3 else ''})"
+        findings.append(finding("WARNING", actors[0], "data-access",
+                                f"{who} read {len(paths)} sensitive path(s) matching '{pat}' (e.g. {paths[0]}) that "
+                                "the passport does not cover: add them to permissions.file_access or data_dependencies, "
+                                "or find out why they were read"))
     order = {"ERROR": 0, "WARNING": 1, "INFO": 2}
     findings.sort(key=lambda f: (order[f["level"]], f["agent_id"]))
     return agents, findings
@@ -754,8 +764,11 @@ def find_by_runtime(agents, **match):
 def on_spawn(root, payload):
     ti = payload.get("tool_input") or {}
     sid = payload.get("session_id")
-    chief = ensure_chief(root)
     agents, _ = load_all(root)
+    chief = find_chief(agents)
+    if not chief:
+        chief = ensure_chief(root)
+        agents, _ = load_all(root)
     agent_type = ti.get("subagent_type") or "general-purpose"
     proj = project_root(root)
     def_file, meta = find_definition(proj, agent_type)
@@ -1383,7 +1396,7 @@ def init_folder(root):
         readme.write_text(README, encoding="utf-8")
     ignore = root / ".gitignore"
     if not ignore.exists():
-        ignore.write_text("__pycache__/\n.state/\n.pending/\n.chief\n.*.lock\n", encoding="utf-8")
+        ignore.write_text("__pycache__/\n.state/\n.pending/\n.chief\n.*.lock\n*.tmp\n", encoding="utf-8")
     sens = root / SENSITIVE_FILE
     if not sens.exists():
         sens.write_text(SENSITIVE_TEMPLATE, encoding="utf-8")
@@ -1589,6 +1602,9 @@ def cmd_directory(args):
     root = root_dir(args)
     agents, _ = load_all(root)
     rows = directory_entries(agents)
+    if not args.all:
+        # Same filter as registry.json: finished subagent runs cannot be called, so they stay out by default.
+        rows = [r for r in rows if r["kind"] != "ephemeral" or r["invocable"]]
     if args.json:
         print(json.dumps(rows, indent=2, ensure_ascii=False))
         return
@@ -1604,6 +1620,9 @@ def cmd_directory(args):
     gone = [r for r in rows if not r["invocable"]]
     if gone:
         print("\nNot invocable: " + ", ".join(f"{r['agent_id']} ({r['status']})" for r in gone))
+    hidden = len(agents) - len(rows)
+    if hidden:
+        print(f"\n{hidden} finished subagent run(s) not listed (they cannot be invoked); use --all to list them.")
 
 
 # ---------------------------------------------------------------- report: who did what
@@ -2009,6 +2028,20 @@ def cmd_anchor(args):
 
 # ---------------------------------------------------------------- build outputs
 
+def write_atomic(path, text):
+    """Write via a temp file and replace, so a hook killed halfway never leaves a truncated page or registry."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        os.replace(tmp, path)
+    except OSError:  # for example the file is open in a viewer on Windows
+        path.write_text(text, encoding="utf-8")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 BUILD_INTERVAL = 30  # seconds: during busy sessions the page is rebuilt at most this often
 
 
@@ -2043,9 +2076,9 @@ def write_outputs(root, force=True):
         "graphify": {"path": gi["path"], "built_at": gi["built_at"], "files_in_graph": len(gi["files"])} if gi else None,
         "passports": {aid: {k: v for k, v in p.items() if not k.startswith("_")} for aid, p in agents.items()},
     }
-    (root / "registry.json").write_text(json.dumps(registry, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    (root / "REGISTRY.md").write_text(render_markdown(registry, runs, changes), encoding="utf-8")
-    (root / "registry.html").write_text(render_html(dict(registry, _root=root), agents, gi), encoding="utf-8")
+    write_atomic(root / "registry.json", json.dumps(registry, indent=2, ensure_ascii=False) + "\n")
+    write_atomic(root / "REGISTRY.md", render_markdown(registry, runs, changes))
+    write_atomic(root / "registry.html", render_html(dict(registry, _root=root), agents, gi))
     return registry
 
 
@@ -2626,6 +2659,7 @@ def main():
 
     p = sub.add_parser("directory")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--all", action="store_true", help="include finished subagent runs")
     p.set_defaults(fn=cmd_directory)
 
     args = ap.parse_args()

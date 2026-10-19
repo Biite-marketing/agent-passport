@@ -58,6 +58,8 @@ register agents with two commands (`spawn` / `end`).
 - **What it is not:** a certified compliance product. It does not see reads or changes done through the shell
   (a script, `cat`, `sed -i`), only through the agent's own tools, and not work outside hooked tools. It records declared permissions but doesn't enforce them, and
   reviewer names are self-declared. See `references/audit.md` for the full list of limits.
+- **Size:** tested up to about 5,000 subagent runs per project. Beyond that, start a new `agent-passports/`
+  folder per period or workstream and keep the old one as the archive.
 - **Graphify link (read-only):** if the project has `graphify-out/graph.json`, every changed file shows its graph
   cluster and connected files. The skill never writes to `graphify-out/`.
 - **Organogram:** `agent-passports/registry.html` shows humans, the chief (main session), agents and subagent

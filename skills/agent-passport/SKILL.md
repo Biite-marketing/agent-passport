@@ -62,7 +62,7 @@ Before `init`, call `<skill-dir>/scripts/passport.py`. After `init`, use `agent-
 | `trace <file\|folder\|graphify cluster>` | **audit**: who changed it, when, with which tool, file hash after the change, related files in the graphify graph, and the passports of the agents involved |
 | `verify [--head COUNT:HASH] [--anchors FILE]` | check the hash chain and compare it with every anchor: detects edits, and with an external anchor also a rewritten, truncated or deleted log |
 | `anchor [--reason]` | record the log's current head now (also sent to `PASSPORT_ANCHOR_FILE` / `PASSPORT_ANCHOR_URL` if set) |
-| `directory` | which agents can be invoked now, and how |
+| `directory [--all]` | which agents can be invoked now, and how. Finished subagent runs are only counted; `--all` (also with `--json`) lists them |
 | `validate [--strict]` | check all rules; exit 1 on errors |
 | `build` | regenerate registry.html, REGISTRY.md, registry.json |
 
@@ -125,6 +125,8 @@ Reads are logged too. Read, Grep, Glob, WebFetch and WebSearch are recorded as w
 Know the limits before you rely on it:
 - **Reads through the shell are not seen.** `cat`, `grep` or a script that opens files shows up only as the command. Glob logs the search, not the files it listed.
 - **Indirect changes are not attributed per file.** A file changed by a shell command (`sed -i`, a script, `git checkout`) only shows up as the command.
+- **Size.** It is built and tested for projects with tens to hundreds of agents and up to about 5,000 subagent runs per project. Beyond that, the hooks at spawn and session end, `validate`, `build` and `registry.html` get slow and heavy (they scale with the number of runs). For a very large project, start a new `agent-passports/` folder per period or workstream, `anchor` the old one and keep it as the archive.
+- **Ending the chief.** `end` on the chief is allowed. The next spawn registers a new chief and the log records both. Check the ID before you end a run.
 - **Errors leave gaps, not blocks.** A hook error never stops the agent. It is recorded as a gap in the trail, and validation flags it.
 
 To investigate:
