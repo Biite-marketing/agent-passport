@@ -26,13 +26,12 @@ Set PASSPORT_TODAY=YYYY-MM-DD to fake today's date (useful for tests).
 """
 import argparse
 import datetime as dt
+import fnmatch
 import hashlib
 import html
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -47,6 +46,11 @@ SPAWN_TOOLS = {"Agent", "Task"}
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 COMMAND_TOOLS = {"Bash", "PowerShell"}
 TRACKED_TOOLS = SPAWN_TOOLS | FILE_TOOLS | COMMAND_TOOLS
+PRE_TOOLS = TRACKED_TOOLS                                   # tools the PreToolUse hook needs to see
+READ_TOOLS = {"Read", "Grep", "Glob", "WebFetch", "WebSearch"}
+MAX_SEARCH_FILES = 100                                       # matched files recorded per Grep call
+SENSITIVE_FILE = "sensitive-paths.txt"
+DEFAULT_SENSITIVE = [".env*", "*.pem", "*.key", "id_rsa*", "*secret*", "*credentials*"]
 PROTECTED_FILES = {"activity.jsonl", "anchors.jsonl"}
 
 # Secret redaction. Best effort: applied to commands and MCP inputs before anything is written.
@@ -377,6 +381,13 @@ def activity(root, event, **fields):
     deletion or reordering breaks the chain. That detects changes, but anyone with write access can
     recompute the whole chain; only anchors stored outside the agent's reach (see `anchor`) make
     rewriting or truncating the log detectable."""
+    activity_batch(root, [(event, fields)])
+
+
+def activity_batch(root, items):
+    """Append several chained entries under one lock with a single write and fsync."""
+    if not items:
+        return
     root.mkdir(parents=True, exist_ok=True)
     path = root / "activity.jsonl"
     with FileLock(root, ".activity.lock") as lock:
@@ -388,14 +399,17 @@ def activity(root, event, **fields):
                     prev = json.loads(last).get("hash") or hashlib.sha256(last.encode("utf-8")).hexdigest()
                 except ValueError:
                     prev = hashlib.sha256(last.encode("utf-8")).hexdigest()
-        entry = {"ts": now_iso(), "event": event, **fields, "prev": prev}
-        if not lock.held:
-            entry["lock"] = "timeout"  # written without the lock: a later chain break here is a race, not tampering
-        entry["hash"] = entry_hash(entry)
-        data = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
+        out = []
+        for event, fields in items:
+            entry = {"ts": now_iso(), "event": event, **fields, "prev": prev}
+            if not lock.held:
+                entry["lock"] = "timeout"  # written without the lock: a later chain break here is a race, not tampering
+            entry["hash"] = entry_hash(entry)
+            prev = entry["hash"]
+            out.append(json.dumps(entry, ensure_ascii=False) + "\n")
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
         try:
-            os.write(fd, data)  # one write call, so a line is never interleaved with another
+            os.write(fd, "".join(out).encode("utf-8"))  # one write call, so lines are never interleaved
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -488,9 +502,10 @@ def file_digest(root, rel):
 
 def git_user():
     try:
+        import subprocess  # loaded only when needed: keeps every hook call fast
         out = subprocess.run(["git", "config", "user.name"], capture_output=True, text=True, timeout=5)
         return out.stdout.strip() or None
-    except (OSError, subprocess.SubprocessError):
+    except Exception:  # git missing or not a repo: no name, no problem
         return None
 
 
@@ -653,6 +668,18 @@ def validate(root):
         if e.get("event") == "audit_log_edit":
             findings.append(finding("WARNING", e.get("actor") or str(e.get("subagent_id")), "audit-trail",
                                     f"{e.get('file')} was edited directly at {e.get('ts')}; run verify"))
+    # Who read sensitive paths without the passport saying they may.
+    flagged = {}
+    for r in read_ledger(root, agents)[0]:
+        if r["sens"]:
+            flagged.setdefault((r["actor"], r["pattern"]), []).append(r["path"])
+    for (actor, pat), paths in flagged.items():
+        uncovered = sorted({x for x in paths if not declares_access(agents.get(actor), agents, x)})
+        if uncovered:
+            findings.append(finding("WARNING", actor, "data-access",
+                                    f"read {len(uncovered)} sensitive path(s) matching '{pat}' (e.g. {uncovered[0]}) that its "
+                                    "passport does not cover: add them to permissions.file_access or data_dependencies, "
+                                    "or find out why they were read"))
     order = {"ERROR": 0, "WARNING": 1, "INFO": 2}
     findings.sort(key=lambda f: (order[f["level"]], f["agent_id"]))
     return agents, findings
@@ -683,7 +710,7 @@ def ensure_chief(root, platform="claude-code"):
 
 
 def _create_chief(root, platform):
-    owner =os.environ.get("PASSPORT_OWNER") or git_user() or "unknown (set the accountable human)"
+    owner = os.environ.get("PASSPORT_OWNER") or git_user() or "unknown (set the accountable human)"
     p = json.loads(json.dumps(TEMPLATE))
     p.update({
         "name": "chief",
@@ -957,6 +984,19 @@ def on_session_end(root, payload):
     activity(root, "session_end", session_id=sid, reason=payload.get("reason"))
 
 
+def cached_chief(root):
+    """Id of the active chief from a one-line cache, checked against its passport. Avoids loading every
+    passport on each hook call (this matters for read hooks, which fire very often)."""
+    try:
+        cid = (root / ".chief").read_text(encoding="utf-8").strip()
+        p = json.loads(passport_path(root, cid).read_text(encoding="utf-8"))
+        if p.get("role") == "chief" and p.get("status") not in TERMINAL:
+            return cid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def resolve_actor(root, payload):
     """Tool calls made inside a subagent carry its runtime agent_id. That raw id is what gets stored;
     it is resolved to a passport when the trail is read, after PostToolUse has made the authoritative
@@ -964,8 +1004,15 @@ def resolve_actor(root, payload):
     sub = payload.get("agent_id")
     if sub:
         return None, sub
+    cid = cached_chief(root)
+    if cid:
+        return cid, None
     agents, _ = load_all(root)
     chief = find_chief(agents) or ensure_chief(root)
+    try:
+        (root / ".chief").write_text(chief["agent_id"], encoding="utf-8")
+    except OSError:
+        pass
     return chief["agent_id"], None
 
 
@@ -1023,6 +1070,141 @@ def on_tool_use(root, payload):
                  description=clip(ti.get("description"), 120) or None, failed=failed)
 
 
+def sensitive_patterns(root):
+    pats = list(DEFAULT_SENSITIVE)
+    try:
+        for line in (root / SENSITIVE_FILE).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                pats.append(line)
+    except OSError:
+        pass
+    return pats
+
+
+def match_sensitive(pats, rel):
+    """The first sensitive pattern a project-relative path matches, else None."""
+    if not rel:
+        return None
+    low = rel.lower()
+    name = low.rsplit("/", 1)[-1]
+    if name in {".env.example", ".env.sample", ".env.template", ".env.dist"}:
+        return None  # templates hold no real secrets
+    for pat in pats:
+        p = pat.lower().replace("\\", "/")
+        if fnmatch.fnmatch(name, p) or fnmatch.fnmatch(low, p) or fnmatch.fnmatch(low, p.rstrip("/") + "/*"):
+            return pat
+    return None
+
+
+def strip_url(url):
+    """Drop the query string and fragment (they often carry tokens), then redact what is left."""
+    return redact(re.sub(r"[?#].*$", "", str(url or "")))
+
+
+def _state_path(root, sid):
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(sid or "nosession"))
+    return root / ".state" / f"reads-{safe}.json"
+
+
+def _load_state(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def read_items(root, payload):
+    """(kind, text) pairs for one read-type tool call. No contents, no hashes: what was looked at, not what it said."""
+    tool = payload.get("tool_name")
+    ti = payload.get("tool_input") or {}
+    resp = payload.get("tool_response")
+    items = []
+    if tool == "Read":
+        items.append(("file", rel_to_project(root, ti.get("file_path") or ti.get("notebook_path"))))
+    elif tool == "Grep":
+        scope = rel_to_project(root, ti.get("path")) or "."
+        items.append(("search", f"grep {clip(redact(ti.get('pattern')), 120)} in {scope}"))
+        names = resp.get("filenames") if isinstance(resp, dict) else None
+        for f in (names or [])[:MAX_SEARCH_FILES]:  # files whose content the agent saw in the result
+            items.append(("file", rel_to_project(root, f)))
+    elif tool == "Glob":
+        scope = rel_to_project(root, ti.get("path")) or "."
+        items.append(("search", f"glob {clip(redact(ti.get('pattern')), 120)} in {scope}"))
+    elif tool == "WebFetch":
+        items.append(("url", clip(strip_url(ti.get("url")), 200)))
+    elif tool == "WebSearch":
+        items.append(("query", clip(redact(ti.get("query")), 200)))
+    prefix = root.name + "/"
+    return [(k, t) for k, t in items if t and not (k == "file" and t.startswith(prefix))]
+
+
+def on_read(root, payload):
+    """Record what an agent looked at. Each (agent, item) is logged once per session with a counter kept in a
+    small state file; reads of sensitive paths are always logged. A summary is written when the agent or
+    session ends (see flush_reads)."""
+    items = read_items(root, payload)
+    if not items:
+        return
+    actor, sub = resolve_actor(root, payload)
+    key_actor = sub or actor
+    base = {"actor": actor, "subagent_id": sub, "session_id": payload.get("session_id"), "tool": payload.get("tool_name")}
+    pats = sensitive_patterns(root)
+    path = _state_path(root, payload.get("session_id"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    batch = []
+    with FileLock(root, ".reads.lock"):
+        state = _load_state(path)
+        for kind, text in items:
+            key = f"{key_actor}|{kind}|{text}"
+            seen = key in state
+            state[key] = state.get(key, 0) + 1
+            pat = match_sensitive(pats, text) if kind == "file" else None
+            if seen and not pat:
+                continue
+            fields = {**base, "kind": kind, "path": text}
+            if pat:
+                fields.update(sens=True, pattern=pat)
+            batch.append(("read", fields))
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(tmp, path)
+    activity_batch(root, batch)
+
+
+def flush_reads(root, sid, only_actor=None):
+    """Write one reads_summary per agent from the session's counters and drop what was summarised."""
+    path = _state_path(root, sid)
+    if not path.exists():
+        return
+    summaries = {}
+    with FileLock(root, ".reads.lock"):
+        state = _load_state(path)
+        keep = {}
+        for key, n in state.items():
+            actor, kind, text = (key.split("|", 2) + ["", ""])[:3]
+            if only_actor and actor != only_actor:
+                keep[key] = n
+                continue
+            g = summaries.setdefault(actor, {"unique": 0, "total": 0, "repeats": {}})
+            g["unique"] += 1
+            g["total"] += n
+            if n > 1 and len(g["repeats"]) < 50:
+                g["repeats"][text] = n
+        if keep:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(keep), encoding="utf-8")
+            os.replace(tmp, path)
+        else:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    activity_batch(root, [("reads_summary", {"actor": a if ID_RE.match(a) else None,
+                                              "subagent_id": None if ID_RE.match(a) else a,
+                                              "session_id": sid, **g}) for a, g in summaries.items()])
+
+
 def cmd_hook(args):
     """Never fails the agent because of a registry problem: errors go to hook-errors.log and are
     recorded in the trail as a gap. The only thing it ever blocks is a direct edit of the audit log."""
@@ -1052,6 +1234,9 @@ def cmd_hook(args):
             on_spawn(root, payload)
         elif event == "PostToolUse" and payload.get("tool_name") in SPAWN_TOOLS:
             on_spawn_done(root, payload)
+        elif event == "PostToolUse" and payload.get("tool_name") in READ_TOOLS:
+            on_read(root, payload)
+            return
         elif event == "PostToolUse" and (payload.get("tool_name") in FILE_TOOLS | COMMAND_TOOLS
                                          or str(payload.get("tool_name")).startswith("mcp__")):
             on_tool_use(root, payload)
@@ -1059,8 +1244,10 @@ def cmd_hook(args):
         elif event == "SubagentStart":
             on_subagent_start(root, payload)
         elif event == "SubagentStop":
+            flush_reads(root, payload.get("session_id"), payload.get("agent_id"))
             on_subagent_stop(root, payload)
         elif event == "SessionEnd":
+            flush_reads(root, payload.get("session_id"))
             on_session_end(root, payload)
             anchor(root, "session end", by=HOOK_BY)
         else:
@@ -1078,6 +1265,18 @@ def cmd_hook(args):
     sys.exit(0)
 
 
+def is_passport_command(cmd):
+    return "passport.py" in cmd or "import passport;" in cmd
+
+
+def hook_command(python, folder, dir_arg, extra=""):
+    """Run the script as an imported module: Python then keeps the compiled version and skips about
+    60 ms of compiling on every hook call. -S skips site-packages, the tool needs only the standard library."""
+    # dont_write_bytecode=False: some environments set PYTHONDONTWRITEBYTECODE, which would defeat the cache
+    code = "import sys;sys.dont_write_bytecode=False;sys.path.insert(0,r'" + folder + "');import passport;passport.main()"
+    return f'{python} -S -c "{code}" --dir "{dir_arg}" hook{extra}'
+
+
 GLOBAL_HOME = Path.home() / ".agent-passport"
 OPT_OUT_FILE = ".no-agent-passports"
 
@@ -1086,7 +1285,8 @@ def has_project_hooks(proj):
     for name in ("settings.json", "settings.local.json"):
         f = proj / ".claude" / name
         try:
-            if "passport.py" in f.read_text(encoding="utf-8") and "--global-hook" not in f.read_text(encoding="utf-8"):
+            text = f.read_text(encoding="utf-8")
+            if is_passport_command(text) and "--global-hook" not in text:
                 return True
         except OSError:
             pass
@@ -1112,14 +1312,14 @@ def global_hook_applies(root):
 
 def write_hooks(settings_path, command):
     settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
-    wanted = {"PreToolUse": "|".join(sorted(TRACKED_TOOLS)),
-              "PostToolUse": "|".join(sorted(TRACKED_TOOLS)) + "|mcp__.*",
+    wanted = {"PreToolUse": "|".join(sorted(PRE_TOOLS)),
+              "PostToolUse": "|".join(sorted(TRACKED_TOOLS | READ_TOOLS)) + "|mcp__.*",
               "SubagentStart": None, "SubagentStop": None, "SessionEnd": None}
     hooks = settings.setdefault("hooks", {})
     for event, matcher in wanted.items():
         # Replace an older passport hook instead of adding a second one; other hooks are left alone.
         entries = [e for e in hooks.get(event, [])
-                   if not any("passport.py" in h.get("command", "") for h in e.get("hooks", []))]
+                   if not any(is_passport_command(h.get("command", "")) for h in e.get("hooks", []))]
         hooks[event] = entries
         if command is None:
             if not entries:
@@ -1140,10 +1340,11 @@ def cmd_install_hooks(args):
         # User level: every project gets its own agent-passports/ on its first agent activity.
         GLOBAL_HOME.mkdir(parents=True, exist_ok=True)
         script = GLOBAL_HOME / "passport.py"
+        import shutil
         shutil.copy2(Path(__file__).resolve(), script)
         python = args.python or Path(sys.executable).as_posix()  # this machine's interpreter: no PATH guessing
-        command = (f'"{python}" "{script.as_posix()}" --dir "$CLAUDE_PROJECT_DIR/agent-passports" '
-                   f'hook --global-hook')
+        command = hook_command(f'"{python}"', script.parent.as_posix(), "$CLAUDE_PROJECT_DIR/agent-passports",
+                               " --global-hook")
         settings_path = Path.home() / ".claude" / "settings.json"
         write_hooks(settings_path, None if args.remove else command)
         if args.remove:
@@ -1159,7 +1360,7 @@ def cmd_install_hooks(args):
     settings_path = proj / ".claude" / ("settings.local.json" if args.local else "settings.json")
     python = args.python or ("python" if os.name == "nt" else "python3")
     rel = root.relative_to(proj).as_posix()
-    command = f'{python} "$CLAUDE_PROJECT_DIR/{rel}/passport.py" --dir "$CLAUDE_PROJECT_DIR/{rel}" hook'
+    command = hook_command(python, f"$CLAUDE_PROJECT_DIR/{rel}", f"$CLAUDE_PROJECT_DIR/{rel}")
     write_hooks(settings_path, None if args.remove else command)
     if args.remove:
         print(f"Agent-passport hooks removed from {settings_path.relative_to(proj).as_posix()}")
@@ -1175,10 +1376,17 @@ def init_folder(root):
     (root / "passports").mkdir(parents=True, exist_ok=True)
     here = Path(__file__).resolve()
     if here.parent != root:
+        import shutil
         shutil.copy2(here, root / "passport.py")
     readme = root / "README.md"
     if not readme.exists():
         readme.write_text(README, encoding="utf-8")
+    ignore = root / ".gitignore"
+    if not ignore.exists():
+        ignore.write_text("__pycache__/\n.state/\n.pending/\n.chief\n.*.lock\n", encoding="utf-8")
+    sens = root / SENSITIVE_FILE
+    if not sens.exists():
+        sens.write_text(SENSITIVE_TEMPLATE, encoding="utf-8")
 
 
 def cmd_init(args):
@@ -1406,6 +1614,12 @@ def report_rows(root, since=None, session=None):
     for t in file_ledger_entries(root, agents):
         if t["event"] == "file_change" and t["file"]:  # commands have no file
             touched.setdefault(t["actor"], []).append(t["file"])
+    read_by, sens_by = {}, {}
+    for r in read_ledger(root, agents)[0]:
+        if r["kind"] == "file":
+            read_by.setdefault(r["actor"], set()).add(r["path"])
+        if r["sens"]:
+            sens_by[r["actor"]] = sens_by.get(r["actor"], 0) + 1
     rows = []
     for aid, p in sorted(agents.items()):
         if p.get("kind") != "ephemeral":
@@ -1423,6 +1637,7 @@ def report_rows(root, since=None, session=None):
             "tools": get(p, "permissions.tools"), "duration_s": round(rt["duration_ms"] / 1000) if rt.get("duration_ms") else None,
             "tokens": rt.get("tokens"), "result": rt.get("result_summary"), "session": str(rt.get("session_id") or "")[:8],
             "files": sorted(set(touched.get(aid, []))), "role": role_of(p, agents),
+            "reads": sorted(read_by.get(aid, [])), "sens_reads": sens_by.get(aid, 0),
         })
     rows.sort(key=lambda r: r["started"])
     changes = []
@@ -1468,20 +1683,24 @@ def render_report(rows, changes, since=None):
 def render_summary(rows, since=None):
     roles = {}
     for r in rows:
-        g = roles.setdefault(r["role"], {"runs": 0, "running": 0, "stopped": 0, "tokens": 0, "files": set(), "last": ""})
+        g = roles.setdefault(r["role"], {"runs": 0, "running": 0, "stopped": 0, "tokens": 0, "files": set(), "last": "",
+                                         "reads": set(), "sens": 0})
         g["runs"] += 1
         g["running"] += r["status"] == "production"
         g["stopped"] += r["status"] == "killed"
         g["tokens"] += r["tokens"] or 0
         g["files"].update(r["files"])
+        g["reads"].update(r.get("reads") or [])
+        g["sens"] += r.get("sens_reads") or 0
         g["last"] = max(g["last"], r["started"] or "")
     sessions = {r["session"] for r in rows if r["session"]}
     out = [f"Agent activity summary{' since ' + since if since else ''}: {len(rows)} subagent runs, "
            f"{len(roles)} roles, {len(sessions)} sessions.", "",
-           "| Role | Runs | Running | Stopped | Tokens | Files changed | Last run |", "|---|---|---|---|---|---|---|"]
+           "| Role | Runs | Running | Stopped | Tokens | Files changed | Files read | Sensitive reads | Last run |",
+           "|---|---|---|---|---|---|---|---|---|"]
     for role, g in sorted(roles.items(), key=lambda kv: -kv[1]["runs"]):
         out.append(f"| {md_value(role)} | {g['runs']} | {g['running']} | {g['stopped']} | {g['tokens']} | "
-                   f"{len(g['files'])} | {g['last'][:16].replace('T', ' ')} |")
+                   f"{len(g['files'])} | {len(g['reads'])} | {g['sens']} | {g['last'][:16].replace('T', ' ')} |")
     out += ["", "Details per run: `report --since <date>` or open agent-passports/registry.html."]
     return "\n".join(out) + "\n"
 
@@ -1522,6 +1741,56 @@ def file_ledger_entries(root, agents=None):
                     "file": e.get("file"), "sha256": e.get("sha256"), "command": e.get("command"),
                     "failed": e.get("failed"), "session": str(e.get("session_id") or "")[:8]})
     return out
+
+
+def read_ledger(root, agents=None, events=None):
+    """Read events and per-agent read summaries, with the actor resolved to a passport."""
+    if agents is None:
+        agents, _ = load_all(root)
+    by_sub = {get(p, "runtime.agent_id"): aid for aid, p in agents.items() if get(p, "runtime.agent_id")}
+    reads, sums = [], []
+    for e in (events if events is not None else read_activity(root)):
+        ev = e.get("event")
+        if ev not in ("read", "reads_summary"):
+            continue
+        sub = e.get("subagent_id")
+        actor = (by_sub.get(sub) or f"unresolved:{sub}") if sub else (e.get("actor") or "unknown")
+        if ev == "read":
+            reads.append({"ts": e.get("ts"), "actor": actor, "actor_name": (agents.get(actor) or {}).get("name"),
+                          "tool": e.get("tool"), "kind": e.get("kind"), "path": e.get("path"),
+                          "sens": bool(e.get("sens")), "pattern": e.get("pattern"),
+                          "session": str(e.get("session_id") or "")[:8]})
+        else:
+            sums.append({"actor": actor, "unique": e.get("unique", 0), "total": e.get("total", 0),
+                         "repeats": e.get("repeats") or {}, "ts": e.get("ts")})
+    return reads, sums
+
+
+def declares_access(p, agents, path):
+    """True when a passport's permissions.file_access or data_dependencies cover this path.
+    A subagent run is judged by the passport of the agent it is an instance of."""
+    if p is None:
+        return False
+    base = agents.get(p.get("instance_of")) or p
+    cands = []
+    fa = get(base, "permissions.file_access")
+    if isinstance(fa, list):
+        cands += [str(x) for x in fa]
+    elif isinstance(fa, str):
+        cands.append(fa)
+    deps = base.get("data_dependencies")
+    if isinstance(deps, list):
+        cands += [str(d.get("source")) if isinstance(d, dict) else str(d) for d in deps]
+    low = path.lower().replace("\\", "/")
+    name = low.rsplit("/", 1)[-1]
+    for c in cands:
+        c = re.sub(r"\s*\([^)]*\)\s*$", "", c.strip()).lower().replace("\\", "/")
+        if not c or c in ("none", "-", "unknown"):
+            continue
+        if (fnmatch.fnmatch(low, c) or fnmatch.fnmatch(name, c) or fnmatch.fnmatch(low, c.rstrip("/") + "/*")
+                or low.startswith(c.rstrip("/") + "/") or c == low):
+            return True
+    return False
 
 
 def graphify_index(root):
@@ -1591,14 +1860,18 @@ def cmd_trace(args):
                             or any(q in str(n).lower() for n in g["nodes"]))
     hits = [t for t in ledger if t["event"] == "file_change" and matches(t["file"])]
     cmds = [t for t in ledger if t["event"] == "command" and q in (t["command"] or "").lower()]
+    rhits = [r for r in read_ledger(root, agents)[0]
+             if (not args.since or (r["ts"] or "") >= args.since)
+             and (q in (r["path"] or "").lower() or (r["kind"] == "file" and matches(r["path"])))]
     if args.json:
-        print(json.dumps({"query": args.query, "file_changes": hits, "commands": cmds}, indent=2, ensure_ascii=False))
+        print(json.dumps({"query": args.query, "file_changes": hits, "commands": cmds, "reads": rhits},
+                         indent=2, ensure_ascii=False))
         return
     print(f"# Trace: {args.query}\n")
     if gi:
         print(f"Graphify graph: {gi['path']} (built {gi['built_at']}, read-only)\n")
-    if not hits and not cmds:
-        print("No recorded file changes or commands match.")
+    if not hits and not cmds and not rhits:
+        print("No recorded file changes, reads or commands match.")
         return
     files = {}
     for t in hits:
@@ -1622,7 +1895,14 @@ def cmd_trace(args):
         for t in cmds:
             print(f"| {t['ts'].replace('T', ' ')} | {t['actor']} {t['actor_name'] or ''} | "
                   f"{md_value(t['command'])} | {md_value(t['failed'])} |")
-    actors = sorted({t["actor"] for t in hits + cmds if t["actor"] in agents})
+    if rhits:
+        print("\n## Read by\n\n| When | Agent | Tool | What | Sensitive |\n|---|---|---|---|---|")
+        for r in rhits[:200]:
+            print(f"| {r['ts'].replace('T', ' ')} | {r['actor']} {r['actor_name'] or ''} | {r['tool']} | "
+                  f"{md_value(r['path'])} | {('yes (' + r['pattern'] + ')') if r['sens'] else '-'} |")
+        if len(rhits) > 200:
+            print(f"... and {len(rhits) - 200} more")
+    actors = sorted({t["actor"] for t in hits + cmds + rhits if t["actor"] in agents})
     if actors:
         print("\n## Agents involved\n")
         for aid in actors:
@@ -1928,9 +2208,31 @@ def view_data(reg, agents, gi):
             e["p"] = t["command"]
             e["fail"] = t["failed"]
         events.append(e)
+    rd, rsums = read_ledger(reg["_root"], agents)
+    agg = {}
+    for r in rd:  # one row per agent and item, however often it was read
+        key = (r["actor"], r["kind"], r["path"])
+        g = agg.get(key)
+        if g is None:
+            g = agg[key] = {"a": r["actor"], "k": (r["kind"] or "f")[0], "p": r["path"], "t": r["ts"], "n": 1, "x": r["tool"]}
+            if r["sens"]:
+                g.update(s=1, pt=r["pattern"])
+        else:
+            g["n"] += 1
+            g["t"] = r["ts"]
+    totals = {}
+    for sm in rsums:
+        t = totals.setdefault(sm["actor"], {"u": 0, "t": 0})
+        t["u"] += sm["unique"]
+        t["t"] += sm["total"]
+        for text, n in sm["repeats"].items():
+            for (actor, kind, path), g in agg.items():
+                if actor == sm["actor"] and path == text and not g.get("s"):
+                    g["n"] = max(g["n"], n)
+    reads = sorted(agg.values(), key=lambda g: g["t"] or "")[-5000:]
     return {"generated_at": reg["generated_at"], "project": project_root(reg["_root"]).name,
             "summary": reg["summary"], "findings": reg["findings"], "persistent": persistent, "runs": runs,
-            "events": events, "graph": gfiles,
+            "events": events, "graph": gfiles, "reads": reads, "read_totals": totals,
             "graphify": {"path": gi["path"], "built_at": gi["built_at"]} if gi else None}
 
 
@@ -2023,7 +2325,7 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}code{font-size:12px}
 <aside id="side"><h2>Select something</h2><p class="muted">Click an agent or a role card for its passport and its runs. Click any run for the full trail: task, model, files with hashes, commands and result.</p></aside>
 </main>
 <script>
-const D=__DATA__, P=D.persistent, R=D.runs, E=D.events;
+const D=__DATA__, P=D.persistent, R=D.runs, E=D.events, RD=D.reads||[], RT=D.read_totals||{};
 const esc=s=>String(s??'-').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmt=v=>{if(v==null||v===''||(Array.isArray(v)&&!v.length))return '-';if(Array.isArray(v))return v.map(fmt).join(', ');if(typeof v==='object')return Object.entries(v).filter(([k,x])=>x!=null&&x!=='').map(([k,x])=>k+': '+fmt(x)).join('; ');return String(v)};
 const ts=s=>s?new Date(s).getTime():NaN, hm=s=>s?String(s).replace('T',' ').slice(0,16):'-';
@@ -2062,8 +2364,10 @@ document.getElementById('org').innerHTML=`<div class="legend">${['development','
 // ---------- runs table
 const RS={q:'',role:'',status:'',session:'',sort:'start',asc:false,limit:100};
 function filteredRuns(){const q=RS.q.toLowerCase();return R.filter(r=>inP(r.start)&&(!RS.role||r.role===RS.role)&&(!RS.status||r.status===RS.status)&&(!RS.session||r.session===RS.session)&&(!q||[r.id,r.task,r.role,r.result,r.model].join(' ').toLowerCase().includes(q)))}
+const readsBy={};RD.forEach(r=>(readsBy[r.a]=readsBy[r.a]||[]).push(r));
+const nFiles=a=>(readsBy[a]||[]).filter(z=>z.k==='f').length;
 const filesBy={},cmdsBy={};E.forEach(e=>{(e.k==='f'?filesBy:cmdsBy)[e.a]=((e.k==='f'?filesBy:cmdsBy)[e.a]||[]).concat([e])});
-function renderRuns(){const rows=filteredRuns(),k=RS.sort;rows.sort((a,b)=>{let x=a[k],y=b[k];if(k==='files'){x=(filesBy[a.id]||[]).length;y=(filesBy[b.id]||[]).length}if(k==='start'){x=ts(x);y=ts(y)}return (x>y?1:x<y?-1:0)*(RS.asc?1:-1)});
+function renderRuns(){const rows=filteredRuns(),k=RS.sort;rows.sort((a,b)=>{let x=a[k],y=b[k];if(k==='files'){x=(filesBy[a.id]||[]).length;y=(filesBy[b.id]||[]).length}if(k==='reads'){x=nFiles(a.id);y=nFiles(b.id)}if(k==='start'){x=ts(x);y=ts(y)}return (x>y?1:x<y?-1:0)*(RS.asc?1:-1)});
 const roles=[...new Set(R.map(r=>r.role))].sort(),sess=[...new Set(R.filter(r=>inP(r.start)).map(r=>r.session))].filter(Boolean).sort().reverse();
 const opt=(v,l,cur)=>`<option value="${esc(v)}"${v===cur?' selected':''}>${esc(l)}</option>`;
 const col=(k,l,c='')=>`<th data-k="${k}" class="${c} ${RS.sort===k?'sorted'+(RS.asc?' asc':''):''}">${l}</th>`;
@@ -2072,16 +2376,16 @@ document.getElementById('runs').innerHTML=`<div class="bar"><input id="rq" place
 <select id="rstat">${opt('','All statuses',RS.status)}${['production','ended','killed'].map(s=>opt(s,s==='production'?'running':s,RS.status)).join('')}</select>
 <select id="rsess">${opt('','All sessions',RS.session)}${sess.map(s=>opt(s,s,RS.session)).join('')}</select>
 <span class="muted">${rows.length} runs</span><button class="btn" id="csv">Export CSV</button></div>
-<table><tr>${col('start','Started')}${col('id','Run')}${col('role','Role')}<th>Task</th>${col('session','Session')}${col('ms','Time','num')}${col('tok','Tokens','num')}${col('model','Model')}${col('files','Files','num')}${col('status','Status')}</tr>
-${rows.slice(0,RS.limit).map(r=>`<tr class="click" data-run="${r.id}"><td>${hm(r.start)}</td><td>${r.id}</td><td>${esc(r.role)}</td><td>${esc((r.task||'').slice(0,90))}</td><td><code>${esc(r.session)}</code></td><td class="num">${dur(r.ms)}</td><td class="num">${num(r.tok)}</td><td>${esc(r.model)}</td><td class="num">${(filesBy[r.id]||[]).length||''}</td><td><span class="pill" style="--c:${statusCol(r.status)}">${r.status==='production'?'running':esc(r.status)}</span></td></tr>`).join('')}</table>
+<table><tr>${col('start','Started')}${col('id','Run')}${col('role','Role')}<th>Task</th>${col('session','Session')}${col('ms','Time','num')}${col('tok','Tokens','num')}${col('model','Model')}${col('files','Files','num')}${col('reads','Reads','num')}${col('status','Status')}</tr>
+${rows.slice(0,RS.limit).map(r=>`<tr class="click" data-run="${r.id}"><td>${hm(r.start)}</td><td>${r.id}</td><td>${esc(r.role)}</td><td>${esc((r.task||'').slice(0,90))}</td><td><code>${esc(r.session)}</code></td><td class="num">${dur(r.ms)}</td><td class="num">${num(r.tok)}</td><td>${esc(r.model)}</td><td class="num">${(filesBy[r.id]||[]).length||''}</td><td class="num">${nFiles(r.id)||''}</td><td><span class="pill" style="--c:${statusCol(r.status)}">${r.status==='production'?'running':esc(r.status)}</span></td></tr>`).join('')}</table>
 ${rows.length>RS.limit?`<p><button class="btn" id="more">Show ${Math.min(100,rows.length-RS.limit)} more</button></p>`:''}`;
 const $=id=>document.getElementById(id);
 $('rq').oninput=e=>{RS.q=e.target.value;RS.limit=100;renderRuns();const i=$('rq');i.focus();i.setSelectionRange(i.value.length,i.value.length)};
 $('rrole').onchange=e=>{RS.role=e.target.value;renderRuns()};$('rstat').onchange=e=>{RS.status=e.target.value;renderRuns()};$('rsess').onchange=e=>{RS.session=e.target.value;renderRuns()};
 if($('more'))$('more').onclick=()=>{RS.limit+=100;renderRuns()};
 document.querySelectorAll('#runs th[data-k]').forEach(th=>th.onclick=()=>{RS.asc=RS.sort===th.dataset.k?!RS.asc:false;RS.sort=th.dataset.k;renderRuns()});
-$('csv').onclick=()=>{const head=['run','role','task','session','started','ended','duration_s','tokens','model','files_changed','commands','status','result'];
-const q=v=>'"'+String(v??'').replace(/"/g,'""')+'"';const lines=[head.join(',')].concat(rows.map(r=>[r.id,r.role,r.task,r.session,r.start,r.end,r.ms!=null?Math.round(r.ms/1000):'',r.tok,r.model,(filesBy[r.id]||[]).map(e=>e.p).join(' | '),(cmdsBy[r.id]||[]).length,r.status,r.result].map(q).join(',')));
+$('csv').onclick=()=>{const head=['run','role','task','session','started','ended','duration_s','tokens','model','files_changed','files_read','commands','status','result'];
+const q=v=>'"'+String(v??'').replace(/"/g,'""')+'"';const lines=[head.join(',')].concat(rows.map(r=>[r.id,r.role,r.task,r.session,r.start,r.end,r.ms!=null?Math.round(r.ms/1000):'',r.tok,r.model,(filesBy[r.id]||[]).map(e=>e.p).join(' | '),nFiles(r.id),(cmdsBy[r.id]||[]).length,r.status,r.result].map(q).join(',')));
 const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([lines.join('\n')],{type:'text/csv'}));a.download=`agent-runs-${D.project}.csv`;a.click()}}
 // ---------- timeline per session
 let tlLimit=8;
@@ -2110,8 +2414,17 @@ ${rk.map(r=>`<tr><td>${esc(r)}</td>${ck.map(c=>{const l=cells[r+'\u0000'+c]||[];
 document.querySelectorAll('#map [data-cell]').forEach(td=>td.onclick=()=>{const [r,c]=td.dataset.cell.split('\u0000');const l=cells[r+'\u0000'+c]||[];
 side(`<h2>${esc(r)}</h2><div class="muted">changed by ${esc(c)} · ${l.length} change${l.length>1?'s':''}</div><div class="list">${l.slice().reverse().map(e=>`<div>${hm(e.t)} · <span class="link" data-file="${esc(e.p)}">${esc(e.p)}</span> · <span class="link" data-runlink="${esc(e.a)}">${esc(e.a)}</span></div>`).join('')}</div>`)})}
 // ---------- files, commands, findings
-function renderFiles(){const f={};E.filter(e=>e.k==='f'&&inP(e.t)).forEach(e=>(f[e.p]=f[e.p]||[]).push(e));const l=Object.entries(f).sort((a,b)=>ts(b[1].at(-1).t)-ts(a[1].at(-1).t));
-document.getElementById('files').innerHTML=l.length?`<p class="muted">Every file an agent changed in this period, newest first. Click a row for its trail.</p><table><tr><th>File</th><th>Cluster / area</th><th>Changes</th><th>Last change</th><th>Last by</th></tr>${l.map(([p,es])=>{const x=es.at(-1);return `<tr class="click" data-file="${esc(p)}"><td>${esc(p)}${es.some(e=>e.flag)?' ⚠':''}</td><td>${esc(clusterOf(p))}</td><td class="num">${es.length}</td><td>${hm(x.t)}</td><td>${esc(x.a)} ${esc(nameOf(x.a))}</td></tr>`}).join('')}</table>`:'<p class="muted">No file changes in this period.</p>'}
+let FM='changed';
+function renderFiles(){
+const bar=`<div class="bar"><button class="btn${FM==='changed'?' pri':''}" data-fm="changed">Changed</button><button class="btn${FM==='read'?' pri':''}" data-fm="read">Read</button></div>`;let body;
+if(FM==='read'){const f={};RD.filter(r=>r.k==='f'&&inP(r.t)).forEach(r=>(f[r.p]=f[r.p]||[]).push(r));
+const lastOf=rs=>rs.map(r=>r.t).sort().at(-1);
+const l=Object.entries(f).sort((a,b)=>(b[1].some(r=>r.s)-a[1].some(r=>r.s))||(ts(lastOf(b[1]))-ts(lastOf(a[1]))));
+body=l.length?`<p class="muted">Files agents read in this period. Each agent is counted once per session; sensitive paths (from sensitive-paths.txt and built-in patterns) are listed first and always logged. Reads through the shell are not seen.</p><table><tr><th>File</th><th>Cluster / area</th><th>Agents</th><th>Reads</th><th>Last read</th></tr>${l.map(([p,rs])=>{const sens=rs.find(r=>r.s);return `<tr class="click" data-file="${esc(p)}"><td>${esc(p)}${sens?' <span class="lvl-WARNING">⚠ sensitive</span>':''}</td><td>${esc(clusterOf(p))}</td><td class="num">${new Set(rs.map(r=>r.a)).size}</td><td class="num">${rs.reduce((t,r)=>t+(r.n||1),0)}</td><td>${hm(lastOf(rs))}</td></tr>`}).join('')}</table>`:'<p class="muted">No reads recorded in this period.</p>'}
+else{const f={};E.filter(e=>e.k==='f'&&inP(e.t)).forEach(e=>(f[e.p]=f[e.p]||[]).push(e));const l=Object.entries(f).sort((a,b)=>ts(b[1].at(-1).t)-ts(a[1].at(-1).t));
+body=l.length?`<p class="muted">Every file an agent changed in this period, newest first. Click a row for its trail.</p><table><tr><th>File</th><th>Cluster / area</th><th>Changes</th><th>Last change</th><th>Last by</th></tr>${l.map(([p,es])=>{const x=es.at(-1);return `<tr class="click" data-file="${esc(p)}"><td>${esc(p)}${es.some(e=>e.flag)?' ⚠':''}</td><td>${esc(clusterOf(p))}</td><td class="num">${es.length}</td><td>${hm(x.t)}</td><td>${esc(x.a)} ${esc(nameOf(x.a))}</td></tr>`}).join('')}</table>`:'<p class="muted">No file changes in this period.</p>'}
+document.getElementById('files').innerHTML=bar+body;
+document.querySelectorAll('#files [data-fm]').forEach(b=>b.onclick=()=>{FM=b.dataset.fm;renderFiles()})}
 function renderCmds(){const c=E.filter(e=>e.k==='c'&&inP(e.t)).slice(-500).reverse();
 document.getElementById('cmd').innerHTML=c.length?`<p class="muted">Shell commands and external (MCP) actions by agents, secrets redacted, newest first${c.length===500?' (latest 500)':''}.</p><table><tr><th>When</th><th>Agent</th><th>Command / action</th><th>Failed</th></tr>${c.map(e=>`<tr class="click" data-runlink="${esc(e.a)}"><td>${hm(e.t)}</td><td>${esc(e.a)} ${esc(nameOf(e.a))}</td><td><code>${esc(e.p)}</code></td><td>${e.fail?'<span class="lvl-ERROR">yes</span>':e.fail===false?'no':'-'}</td></tr>`).join('')}</table>`:'<p class="muted">No commands in this period.</p>'}
 function renderFindings(){document.getElementById('fin').innerHTML=D.findings.length?`<table><tr><th>Level</th><th>Agent</th><th>Rule</th><th>Message</th></tr>${D.findings.map(f=>`<tr class="click" data-runlink="${esc(f.agent_id)}"><td class="lvl-${f.level}">${f.level}</td><td>${esc(f.agent_id)}</td><td>${esc(f.rule)}</td><td>${esc(f.message)}</td></tr>`).join('')}</table>`:'<p>No findings. All passports valid.</p>'}
@@ -2120,12 +2433,14 @@ function side(h){document.getElementById('side').innerHTML=h}
 function dl(rows){return `<dl>${rows.filter(([k,v])=>v!=null&&v!==''&&!(Array.isArray(v)&&!v.length)).map(([k,v])=>`<dt>${k}</dt><dd>${typeof v==='string'&&v.startsWith('<')?v:esc(fmt(v))}</dd>`).join('')}</dl>`}
 function talkBox(text,why){return `<div class="talk"><b>Talk to this agent</b>${text?`<textarea id="msg">${esc(text)}</textarea><button class="btn pri" id="cp">Copy message</button> <span class="muted" id="cpok"></span>`:`<p class="muted">${esc(why)}</p>`}</div>`}
 function bindCopy(){const cp=document.getElementById('cp');if(cp)cp.onclick=async()=>{const t=document.getElementById('msg');try{await navigator.clipboard.writeText(t.value)}catch(e){t.select();document.execCommand('copy')}document.getElementById('cpok').textContent='Copied'}}
-function showRun(id){const r=byId[id];if(!r)return showAgent(id);const fs=filesBy[id]||[],cs=cmdsBy[id]||[];
+function showRun(id){const r=byId[id];if(!r)return showAgent(id);const fs=filesBy[id]||[],cs=cmdsBy[id]||[],rs=readsBy[id]||[],rf=rs.filter(z=>z.k==='f'),ro=rs.filter(z=>z.k!=='f');
 document.querySelectorAll('.blk.sel').forEach(b=>b.classList.remove('sel'));document.querySelectorAll(`.blk[data-run="${id}"]`).forEach(b=>b.classList.add('sel'));
 side(`<h2>${esc(r.id)} · ${esc(r.role)}</h2><div><span class="pill" style="--c:${statusCol(r.status)}">${r.status==='production'?'running':esc(r.status)}</span> <span class="muted">session ${esc(r.session)}${r.auto?' · auto-registered':''}</span></div>
 ${r.inv&&r.agent?talkBox(`Continue subagent ${r.agent} (passport ${r.id}, "${r.task}") with SendMessage: `):''}
 ${dl([['Task',r.task],['Prompt (excerpt)',r.prompt],['Instance of',r.inst?`<span class="link" data-agentlink="${esc(r.inst)}">${esc(r.inst)} ${esc(nameOf(r.inst))}</span>`:null],['Reports to',r.parent?`<span class="link" data-agentlink="${esc(r.parent)}">${esc(r.parent)} ${esc(nameOf(r.parent))}</span>`:null],['Owner (human)',r.owner],['Model',r.model],['Started / ended',hm(r.start)+' → '+hm(r.end)],['Duration · tokens',dur(r.ms)+' · '+num(r.tok)],['Tools',r.tools],['Data',r.data],['Result',r.result],['Transcript',r.transcript]])}
 <h3>Files changed (${fs.length})</h3><div class="list">${fs.map(e=>`<div><span class="link" data-file="${esc(e.p)}">${esc(e.p)}</span>${e.flag?' ⚠ '+esc(e.flag):''}<br><span class="muted">${hm(e.t)} · ${esc(e.tool)} · sha ${esc(e.sha)} · ${esc(clusterOf(e.p))}</span></div>`).join('')||'<div class="muted">none</div>'}</div>
+<h3>Files read (${rf.length}${RT[id]?' · '+RT[id].t+' reads in total':''})</h3><div class="list">${rf.slice(0,40).map(z=>`<div><span class="link" data-file="${esc(z.p)}">${esc(z.p)}</span>${z.s?' <span class="lvl-WARNING">⚠ sensitive ('+esc(z.pt)+')</span>':''}${z.n>1?' ×'+z.n:''}<br><span class="muted">${hm(z.t)} · ${esc(z.x)} · ${esc(clusterOf(z.p))}</span></div>`).join('')||'<div class="muted">none recorded</div>'}${rf.length>40?`<div class="muted">+ ${rf.length-40} more</div>`:''}</div>
+<h3>Searches & web (${ro.length})</h3><div class="list">${ro.slice(0,20).map(z=>`<div><code>${esc(z.p)}</code><br><span class="muted">${hm(z.t)} · ${esc(z.x)}</span></div>`).join('')||'<div class="muted">none recorded</div>'}</div>
 <h3>Commands & actions (${cs.length})</h3><div class="list">${cs.map(e=>`<div><code>${esc(e.p)}</code><br><span class="muted">${hm(e.t)} · ${esc(e.tool)}${e.fail?' · failed':''}</span></div>`).join('')||'<div class="muted">none</div>'}</div>
 <p class="muted" style="font-size:12px">CLI: python agent-passports/passport.py report --session ${esc(r.session)}</p>`);bindCopy()}
 function talkFor(p,id){if(!p.invocable||['suspended','killed','ended'].includes(p.status))return [null,'Status is '+p.status+'; it cannot be invoked.'];
@@ -2142,9 +2457,10 @@ side(`<h2>${esc(role)}</h2><div class="muted">subagent role · reports to ${esc(
 ${dl([['In period',`${s.n} runs · ${s.run} running · ${s.bad} stopped`],['All time',list.length+' runs'],['Average duration',inp.length?dur(avg):'-'],['Tokens in period',num(s.tok)],['Models used',models],['Instance of',inst?`<span class="link" data-agentlink="${esc(inst.inst)}">${esc(inst.inst)} ${esc(nameOf(inst.inst))}</span>`:'no persistent passport (ad-hoc type)'],['Tools',inp[0]&&inp[0].tools]])}
 <h3>Latest runs</h3><div class="list">${inp.slice(0,30).map(r=>`<div class="link" data-runlink="${r.id}">${hm(r.start)} · ${r.id} · ${esc((r.task||'').slice(0,70))} <span class="muted">· ${r.status==='production'?'running':esc(r.status)}</span></div>`).join('')||'<div class="muted">No runs in this period.</div>'}</div>
 ${inp.length>30?`<p><button class="btn" data-rolelink="${esc(role)}">All ${inp.length} in the Runs table →</button></p>`:''}`)}
-function showFile(path){const es=E.filter(e=>e.k==='f'&&e.p===path),g=D.graph[path];
+function showFile(path){const es=E.filter(e=>e.k==='f'&&e.p===path),g=D.graph[path],rd=RD.filter(r=>r.k==='f'&&r.p===path);
 side(`<h2>${esc(path)}</h2><div class="muted">file trail</div>${dl([['Cluster / area',clusterOf(path)],['Graph nodes',g&&g.n],['Connected files (graph)',g&&g.r.length?g.r.map(x=>`<span class="link" data-file="${esc(x)}">${esc(x)}</span>`).join(', '):null]])}
 <h3>Changes (${es.length})</h3><div class="list">${es.slice().reverse().map(e=>`<div><span class="link" data-runlink="${esc(e.a)}">${esc(e.a)} ${esc(nameOf(e.a))}</span>${e.flag?' ⚠ '+esc(e.flag):''}<br><span class="muted">${hm(e.t)} · ${esc(e.tool)} · sha ${esc(e.sha)}</span></div>`).join('')}</div>
+<h3>Read by (${rd.length})</h3><div class="list">${rd.slice().reverse().map(r=>`<div><span class="link" data-runlink="${esc(r.a)}">${esc(r.a)} ${esc(nameOf(r.a))}</span>${r.s?' <span class="lvl-WARNING">⚠ sensitive ('+esc(r.pt)+')</span>':''}${r.n>1?' ×'+r.n:''}<br><span class="muted">${hm(r.t)} · ${esc(r.x)}</span></div>`).join('')||'<div class="muted">no reads recorded</div>'}</div>
 <p class="muted" style="font-size:12px">CLI: python agent-passports/passport.py trace "${esc(path)}"</p>`)}
 document.addEventListener('click',e=>{const t=e.target.closest('[data-run],[data-runlink],[data-agent],[data-agentlink],[data-role],[data-rolelink],[data-file]');if(!t)return;
 if(t.dataset.file!=null){e.preventDefault();return showFile(t.dataset.file)}
@@ -2154,7 +2470,7 @@ const id=t.dataset.run||t.dataset.runlink||t.dataset.agent||t.dataset.agentlink;
 // ---------- header + render all
 function render(){const inp=R.filter(r=>inP(r.start)),roles=new Set(inp.map(r=>r.role)),tok=inp.reduce((t,r)=>t+(r.tok||0),0),files=new Set(E.filter(e=>e.k==='f'&&inP(e.t)).map(e=>e.p));
 document.getElementById('sub').textContent=`${D.project} · generated ${hm(D.generated_at)} · ${D.summary.errors} errors · ${D.summary.warnings} warnings`;
-document.getElementById('kpis').innerHTML=[[Object.keys(P).length,'agents'],[roles.size,'active roles'],[inp.length,'runs'],[inp.filter(r=>r.status==='production').length,'running'],[num(tok),'tokens'],[files.size,'files changed']].map(([n,l])=>`<span class="kpi"><b>${n}</b>${l}</span>`).join('');
+document.getElementById('kpis').innerHTML=[[Object.keys(P).length,'agents'],[roles.size,'active roles'],[inp.length,'runs'],[inp.filter(r=>r.status==='production').length,'running'],[num(tok),'tokens'],[files.size,'files changed']].concat(RD.some(r=>r.s&&inP(r.t))?[[RD.filter(r=>r.s&&inP(r.t)).length,'sensitive reads']]:[]).map(([n,l])=>`<span class="kpi"><b>${n}</b>${l}</span>`).join('');
 renderOrg();renderRuns();renderTimeline();renderMap();renderFiles();renderCmds();renderFindings()}
 setPeriod('7');
 const chief=Object.keys(P).find(i=>P[i].role==='chief');if(chief)showAgent(chief);
@@ -2167,6 +2483,15 @@ window.addEventListener('hashchange',route);route();
 </script></body></html>
 """
 
+
+SENSITIVE_TEMPLATE = """# Paths an agent should not touch without saying so in its passport.
+# One pattern per line (* matches anything, a trailing / means a whole folder). Lines starting with # are comments.
+# Reads of matching paths are always logged and flagged. Built in already: .env*, *.pem, *.key, id_rsa*, *secret*, *credentials*
+# Add your own, for example:
+# customers/
+# data/exports/*.csv
+# patient*
+"""
 
 README = """# Agent passports
 

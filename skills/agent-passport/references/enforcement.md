@@ -71,6 +71,7 @@ It adds one command, `passport.py hook`, to five events (re-running it updates o
 | `SubagentStart` | the subagent's runtime id |
 | `PostToolUse` (Agent/Task) | the model actually used (`resolvedModel`), tokens, duration, result; ends the run unless it runs in the background |
 | `PreToolUse` (Write/Edit/..., Bash/PowerShell) | refuses direct edits to `activity.jsonl` / `anchors.jsonl` |
+| `PostToolUse` (Read/Grep/Glob/WebFetch/WebSearch) | what the agent looked at: path, search or URL (query string removed), never the contents. Once per agent, item and session via a small state file; sensitive paths every time; a summary when the agent or session ends |
 | `PostToolUse` (Write/Edit/MultiEdit/NotebookEdit, Bash/PowerShell, `mcp__*`) | audit trail: file changes made with the edit tools (with the file's SHA-256), commands and external MCP actions, tied to the agent that did them (known secret patterns redacted) |
 | `SubagentStop` | ends background runs with their final message and transcript path |
 | `SessionEnd` | closes anything still open in that session, marks its subagents non-invocable, and writes an anchor (sent out of reach if `PASSPORT_ANCHOR_FILE` / `PASSPORT_ANCHOR_URL` is set) |

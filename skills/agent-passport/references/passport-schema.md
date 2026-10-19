@@ -35,7 +35,7 @@ A passport is one JSON file: `agent-passports/passports/AGT-XXXX.json`. Field na
 | `data_dependencies` | production | List of `{source, type, access, contains_personal_data}`. `type`: database, api, files, mailbox, web, vector-store... `access`: read / write / read-write. Use `[]` if it truly uses none. |
 | `permissions.tools` | production | Every tool / MCP server / function it can call. |
 | `permissions.skills` | optional | Skills or plugins loaded. |
-| `permissions.file_access` | optional | Paths it may read/write. |
+| `permissions.file_access` | optional | Paths it may read or write: globs or folders (`invoices/`, `docs/*.md`), optionally with a note in brackets. `validate` compares this and `data_dependencies` with the sensitive paths the agent actually read, and warns about reads it doesn't cover. |
 | `permissions.network` | optional | Domains or "none" / "unrestricted". |
 | `permissions.secrets` | optional | Names of credentials it uses (never the values). |
 | `permissions.can_spawn_agents` | always | `true` means every agent it spawns needs its own passport. |

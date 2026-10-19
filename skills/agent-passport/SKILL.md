@@ -27,6 +27,7 @@ agent-passports/
 ├── activity.jsonl            hash-chained audit log: spawns, endings, status changes, seals, reviews, file changes
 │                             (with file hash), commands and external MCP actions, each tied to an agent
 ├── anchors.jsonl             checkpoints of the log's head (count + hash), written at every session end
+├── sensitive-paths.txt       paths that count as sensitive when an agent reads them (you extend the built-in list)
 ├── registry.html             the organogram for humans: roles, runs table, session timeline, where agents work
 ├── REGISTRY.md               the same in text: findings, directory, who did what, every passport
 ├── registry.json             machine-readable directory for agents: who exists, who may call whom
@@ -106,7 +107,7 @@ For the visual overview, point the user to `agent-passports/registry.html`. It i
 - **Runs:** a searchable, sortable table of every run, with CSV export.
 - **Timeline:** one block per work session, with a lane per role and parallel runs stacked.
 - **Where agents work:** a matrix of graphify clusters (or folders) against agent roles.
-- **Files**, **Commands** and **Findings.**
+- **Files** (switch between changed and read, sensitive reads first), **Commands** and **Findings.**
 
 A period selector (24 h, 7 days, 30 days, quarter, all) applies to every view. Clicking a run opens its full trail: task, model, files with hashes, commands and result. Deep links such as `registry.html#time`, `#map` or `#AGT-0042` open a view directly.
 
@@ -119,8 +120,10 @@ A period selector (24 h, 7 days, 30 days, quarter, all) applies to every view. C
 
 With hooks installed, file changes made with the edit tools (with the file's SHA-256 after the change), shell commands and external actions through MCP servers (CRM, mail, databases) are written to `activity.jsonl` and tied to the passport of the agent that did them. Changes made by the chief carry the chief's ID. Changes made inside a subagent carry that subagent's runtime ID, which is linked to its passport by the spawn's `tool_use_id`, so parallel subagents of the same type are told apart correctly. Known secret patterns in commands and MCP inputs are redacted before anything is written. This is best effort, so keep secrets out of commands anyway.
 
+Reads are logged too. Read, Grep, Glob, WebFetch and WebSearch are recorded as what the agent looked at, never the contents, once per agent, file and session. URLs lose their query string. Paths matching the built-in patterns (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `*secret*`, `*credentials*`) or the project's `agent-passports/sensitive-paths.txt` are logged every time and flagged. If an agent reads a sensitive path that its passport doesn't cover in `permissions.file_access` or `data_dependencies`, `validate` raises a `data-access` warning. Fix it by declaring the access in the passport (and `seal` it), or by finding out why it was read. Ask "who read X?" with `trace X`.
+
 Know the limits before you rely on it:
-- **Reads are not logged.**
+- **Reads through the shell are not seen.** `cat`, `grep` or a script that opens files shows up only as the command. Glob logs the search, not the files it listed.
 - **Indirect changes are not attributed per file.** A file changed by a shell command (`sed -i`, a script, `git checkout`) only shows up as the command.
 - **Errors leave gaps, not blocks.** A hook error never stops the agent. It is recorded as a gap in the trail, and validation flags it.
 

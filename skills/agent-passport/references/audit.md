@@ -18,6 +18,8 @@ With the Claude Code hooks installed (`install-hooks`), `agent-passports/activit
 | `status` / `seal` / `review` | lifecycle changes, sealed passport changes and reviews, with the real time and whether they were recorded from inside an agent session |
 | `file_change` | Write/Edit/MultiEdit/NotebookEdit: file path, acting agent, tool, session, SHA-256 of the file after the change, size |
 | `command` | shell commands (Bash/PowerShell) and external actions through MCP servers: acting agent, redacted command or input, whether it failed |
+| `read` | Read, Grep, Glob, WebFetch and WebSearch: what the agent looked at (path, search, URL without query string), acting agent, tool, session. Once per agent, file and session, except sensitive paths, which are logged every time and flagged |
+| `reads_summary` | at the end of an agent or session: how many reads, how many unique, and the paths read more than once |
 | `session_end` | when and why a session closed (an anchor is written at the same moment) |
 | `blocked` | an attempt to edit the audit log directly, which was refused |
 | `hook_error` | a gap: the hook failed and the trail may be incomplete around this time |
@@ -25,7 +27,8 @@ With the Claude Code hooks installed (`install-hooks`), `agent-passports/activit
 The passports add the context an auditor asks for: model and version, hosting region, permissions, data sources, owner, reporting line, human-in-the-loop rule, review history and the changelog.
 
 **Not recorded** (state this honestly in an audit):
-- **File reads.** Reading is not logged, so an agent that only read data leaves no file trail. Its passport's permissions and data dependencies document what it could read.
+- **Reads outside the read tools.** Reads through the built-in tools are logged (what was looked at, never the contents). Reads done by a shell command (`cat`, `grep`, a script that opens files) show only as the command, and Glob records the search, not the files it listed. An agent that wants to read something unseen can use the shell, so treat the read log as evidence of what agents did through their normal tools, not as proof of everything they could have read.
+- **What was read from the system itself.** MCP reads (for example a CRM lookup) are logged as external actions with their inputs, but the data that came back is not stored.
 - **Changes made outside the hooked tools**, for example by a human in an editor, by a script that a command started (only the command itself is logged), or by agents on platforms without hooks unless they call `spawn`/`end`.
 - **Full file contents and diffs.** Only the hash after each change is stored. Use version control (git) for the diff and match it to the hash.
 - **Secrets.** They are redacted on purpose. The pattern-based redaction is best effort, so keep secrets out of commands anyway.
@@ -37,7 +40,7 @@ The passports add the context an auditor asks for: model and version, hosting re
 
 When something went wrong ("the CRM got wrong lead stages", "config.yaml broke production"):
 
-1. **Find the change.** `python agent-passports/passport.py trace <file, folder, keyword or graphify cluster>`. For an external system, trace the MCP tool name (for example `trace hubspot`).
+1. **Find the change.** `python agent-passports/passport.py trace <file, folder, keyword or graphify cluster>`. The trace also lists which agents read the file. For an external system, trace the MCP tool name (for example `trace hubspot`). For an exposure question ("who looked at customers/?"), the `Read by` section and the *Files > Read* view answer it.
 2. **Identify the agent.** The trace names the passport ID. Open `passports/<ID>.json`. Check:
    - the model (`runtime.resolved_model`) and its permissions;
    - the task it was given (`task.purpose`, `task.in_scope` holds the prompt excerpt);
@@ -65,7 +68,7 @@ This is how the registry can support common controls. It is supporting evidence 
 |---|---|---|
 | ISO/IEC 42001 (AI management system) | Inventory and documentation of AI systems and their resources; life-cycle records; event logging; human oversight; third-party/supplier AI | Passports (purpose, model, provider, hosting, data, owner, human-in-the-loop), status lifecycle and changelog, activity log, quarterly review records |
 | ISO/IEC 27001:2022 Annex A | 5.9 inventory of assets · 5.18 access rights (review records) · 8.15 logging (partially) · 8.32 change management (partially) | Agents as inventoried assets, declared permissions and `who_can_invoke` (documented, not enforced), the review history, the hash-chained log (stronger with external anchors), and rule 2 (sealed changes). It is input for, not a substitute for, 8.16 monitoring, 5.15 access control or 5.23 cloud-service management |
-| NEN 7510 (healthcare information security, built on ISO 27001) | Same controls as above; logging who accessed patient data (see also NEN 7513) | `contains_personal_data` per data source, the data-residency warning, and per-agent attribution of changes and external actions. **It does not meet the healthcare access-logging requirement**: reads are not logged. Use it next to the access logging of the systems that hold the patient data |
+| NEN 7510 (healthcare information security, built on ISO 27001) | Same controls as above; logging who accessed patient data (see also NEN 7513) | `contains_personal_data` per data source, the data-residency warning, and per-agent attribution of changes and external actions. Reads of sensitive paths through the agent's tools are logged and flagged, and `validate` warns when an agent read a sensitive path its passport does not cover. **It does not replace the access logging of the systems that hold the patient data**, and reads through the shell are not seen. Use it as evidence of what agents did, next to that logging |
 | EU AI Act | Mainly relevant if an agent is part of a high-risk system: record-keeping (Art. 12, which is the provider's duty), deployer log retention (Art. 26), human oversight (Art. 14) | An inventory with `risk.eu_ai_act` classification, `human_in_the_loop` per agent, model and provider per run. For most coding and back-office agents this is good practice, not a legal logging obligation |
 
 For an audit, hand over:

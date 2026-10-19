@@ -52,14 +52,17 @@ register agents with two commands (`spawn` / `end`).
   and compares it with anchors: it detects edits, and with an anchor stored outside the project
   (`PASSPORT_ANCHOR_FILE` / `PASSPORT_ANCHOR_URL`) also a rewritten, truncated or deleted log. Direct edits to
   the log are blocked by a hook.
-- **What it is not:** a certified compliance product. It does not log file reads, changes made by scripts that a
-  command started, or work outside hooked tools. It records declared permissions but doesn't enforce them, and
+- **Reads:** which files, searches and web pages agents looked at (never the contents), once per agent and
+  session, with sensitive paths (`.env`, keys, anything in `sensitive-paths.txt`) always logged and flagged.
+  `validate` warns when an agent reads a sensitive path its passport doesn't cover.
+- **What it is not:** a certified compliance product. It does not see reads or changes done through the shell
+  (a script, `cat`, `sed -i`), only through the agent's own tools, and not work outside hooked tools. It records declared permissions but doesn't enforce them, and
   reviewer names are self-declared. See `references/audit.md` for the full list of limits.
 - **Graphify link (read-only):** if the project has `graphify-out/graph.json`, every changed file shows its graph
   cluster and connected files. The skill never writes to `graphify-out/`.
 - **Organogram:** `agent-passports/registry.html` shows humans, the chief (main session), agents and subagent
   runs. Click an agent for its passport and a ready-to-paste message to address it. There are tabs for
-  *Who did what*, *Files*, *Commands* and *Findings*.
+  *Who did what*, *Files* (changed or read), *Commands* and *Findings*.
 
 ## Screenshots
 
@@ -82,6 +85,10 @@ Examples from a fictional busy project: one chief, 324 subagent runs over 10 day
 **Runs**: a searchable, sortable table with CSV export. Click a run for its full trail: task, model, files with hashes, commands and result.
 
 ![Runs](docs/runs.png)
+
+**Reads**: the Files tab switches between changed and read. Sensitive paths come first, with the agent that read them.
+
+![Reads](docs/reads.png)
 
 A period selector (24 h · 7 days · 30 days · quarter · all) applies to every view. Deep links such as `registry.html#time`, `#map`,
 `#AGT-0042` or `#file=src/scoring.py` open a view directly.
